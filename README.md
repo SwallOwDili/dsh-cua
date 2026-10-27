@@ -83,6 +83,7 @@ dsh plugin --profile web add file:/path/to/dsh-cua
 | `paste` | 走剪贴板并还原用户原剪贴板 |
 | `perform_secondary_action` | AXPress / AXShowMenu / AXConfirm / AXRaise 等 |
 | `drag` | 屏幕坐标拖拽 |
+| `open_app` | 打开或激活应用（按名称、bundle id、路径）|
 
 ### AX 树文本格式
 
@@ -207,9 +208,9 @@ Codex 的对应实现是 `SyntheticAppFocusEnforcer`，它的 State 有三个独
 
 ---
 
-## 省 token 的两件事
+## 省 token 与稳定性
 
-Codex 让长会话不炸上下文的两个设计，这里都补齐了。
+Codex 让长会话不炸上下文的几个设计，这里逐条对齐。
 
 **增量输出。** 元素 ID 按结构路径跨快照复用（`AXWindow[0]/AXGroup[1]/AXButton[2]`），
 同一个控件每次拿到同一个编号。`get_app_state` 默认 `diff=auto`：有基线时只返回
@@ -310,18 +311,35 @@ toolCallTimeoutMs: 180000     # 单次调用超时，截图慢时可加
 | `checkPermissions` | `true` | 启动时做一次 TCC 自检 |
 | `failOnPermissionError` | `false` | 缺权限时是否阻止插件激活 |
 
+运行时参数（设置页「Cua」卡片，落到 `~/.dsh/dsh-cua.config.json`，`cua-mcp` 按 mtime 热读）：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `browserCdpPort` | `0` | CDP 端口；0 表示自动读 `DevToolsActivePort` |
+| `browserCdpHost` | `127.0.0.1` | CDP 主机 |
+| `overlayEnabled` | `true` | 是否显示「AI 正在操作」标记与虚拟光标 |
+| `overlayTtlSeconds` | `20` | 无动作后标记保留秒数 |
+| `backgroundSilence` | `true` | 用 `postToPid` 定向投递，不抢焦点；关掉改用真实 HID |
+| `scrollStepPx` | `40` | 滚动单步像素；过大时 Catalyst 应用会丢事件 |
+| `maxElements` | `4000` | 单次快照的节点上限，超出截断 |
+
 ---
 
 ## 目录
 
 ```
 dsh-cua/
-  package.json          # dsh.bundle.patch 指向 cordis.patch.yml
-  cordis.patch.yml      # 插入 mcp-computer-use 这一行
-  index.js              # 插件本体：权限自检 + 路径暴露
-  src/main.swift        # 原生 MCP 服务器（约 900 行）
-  bin/cua-mcp           # 构建产物
-  build.sh              # swiftc 构建 + 自检
+  package.json              # dsh.bundle.patch 指向 cordis.patch.yml
+  cordis.patch.yml          # 插入 mcp-computer-use 这一行
+  index.js                  # 插件本体：权限自检 + 路径暴露 + 配置落盘
+  client.js                 # 前端：配置页卡片 + 右上角实时画面
+  src/main.swift            # 原生 MCP 服务器（约 2100 行，17 个工具）
+  overlay/main.swift        # 标记胶囊 + 虚拟光标（常驻附属进程）
+  live/main.swift           # MJPEG 实时画面服务（常驻，端口 18901）
+  bin/cua-mcp               # 构建产物：MCP 服务器
+  bin/cua-overlay           # 构建产物：标记与光标
+  bin/cua-live              # 构建产物：实时画面
+  build.sh                  # swiftc 构建 + 自检 + 同步到 profile
 ```
 
 ## 重新构建
