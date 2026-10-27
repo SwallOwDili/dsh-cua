@@ -91,6 +91,12 @@ export const RuntimeSettings = Schema.object({
       '记录每次工具调用到 ~/.dsh/dsh-cua-history（时间、工具、目标应用、耗时、脱敏参数），' +
         '并按段聚合出 memory.md。关闭后不再写入，已有历史保留。',
     ),
+  approvalMode: Schema.union(['off', 'once-per-app', 'always'])
+    .default('off')
+    .description(
+      '操作前是否弹窗确认。off 不打扰；once-per-app 每个会话里每个应用问一次；' +
+        'always 每次都问。读操作（查看界面状态、列应用）不触发。',
+    ),
   deniedBundleIDs: Schema.array(Schema.string())
     .default([])
     .description('禁止操作的应用 bundleID 列表。命中即在分发层拒绝，动作不会落到目标应用。'),
@@ -133,6 +139,9 @@ function runSelfTest(binary) {
     passed: out.includes('SELFTEST PASS'),
   }
 }
+
+/** 最近一次 flush 的配置快照，工具执行时读，避免每次重解析。 */
+let currentConfig = { approvalMode: 'off' }
 
 export async function apply(ctx, config) {
   const binary = resolveBinary(config)
@@ -180,6 +189,50 @@ export async function apply(ctx, config) {
   ctx.effect(() => () => bridge.stop(), 'dsh-cua: cua-mcp 生命周期')
   bridge.start()
 
+
+  // ---- 操作前确认（对齐 Codex 的 AppApprovalRequested / Resolved） ----
+  //
+  // 只读工具不打扰：查看界面、列应用、读屏幕状态都不改变任何东西。
+  // 写操作按 approvalMode 决定问不问；once-per-app 在本进程内按
+  // 「会话 + 应用」记一次允许，always 每次都问。
+  const WRITE_TOOLS = new Set([
+    'click', 'type_text', 'press_key', 'scroll', 'set_value',
+    'select_text', 'paste', 'perform_secondary_action', 'open_app', 'drag',
+  ])
+  const approvedScopes = new Set()
+  const approval = ctx.get('approval')
+
+  const askApproval = async (toolName, args, exec) => {
+    const mode = currentConfig?.approvalMode ?? 'off'
+    if (mode === 'off') return
+    if (!WRITE_TOOLS.has(toolName)) return
+    if (!approval || !exec?.agent) return
+
+    const app = typeof args?.app === 'string' ? args.app : ''
+    const scopeKey = `${exec.agent.id}|${app || toolName}`
+    if (mode === 'once-per-app' && approvedScopes.has(scopeKey)) return
+
+    const reason = app
+      ? `要在「${app}」上执行 ${toolName}`
+      : `要执行 ${toolName}`
+    const outcome = await approval.request({
+      agent: exec.agent,
+      toolName,
+      callId: exec.callId,
+      reason,
+      signal: exec.signal,
+    })
+    if (outcome === 'allowed-once') {
+      approvedScopes.add(scopeKey)
+      return
+    }
+    const label =
+      outcome === 'rejected' ? '你拒绝了这次操作' :
+      outcome === 'cancelled' ? '这次操作被取消' :
+      '没有可用的确认方（无人在看），按未授权处理'
+    throw new Error(`dsh-cua: ${label}，${toolName} 未执行`)
+  }
+
   try {
     await bridge.initialize()
     const tools = await bridge.listTools()
@@ -200,6 +253,7 @@ export async function apply(ctx, config) {
             render: (_args, value) => [{ type: 'text', text: value.text }],
           },
           execute: async (args, exec) => {
+            await askApproval(tool.name, args, exec)
             // exec.agent.id 就是发起这次调用的会话；后台任务可能没有 agent
             const sessionId = exec?.agent?.id
             const result = await bridge.callTool(tool.name, args, sessionId)
@@ -229,6 +283,7 @@ export async function apply(ctx, config) {
       const flush = () => {
         // schemastery 解析后的值 = 默认值 + 用户文档覆盖
         const value = RuntimeSettings(scope.get() ?? {})
+        currentConfig = value
         const json = JSON.stringify(value, null, 2) + '\n'
         if (json === lastWritten) return
         lastWritten = json

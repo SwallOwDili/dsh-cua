@@ -1774,20 +1774,12 @@ func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) thr
         throw CUAError.eventFailed("无法创建事件源")
     }
 
-    if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid,
-       let app = NSRunningApplication(processIdentifier: pid) {
-        // 滚轮走 .cghidEventTap，只有真前台才收得到；空 options 在新系统上不够
-        app.activate(options: [.activateIgnoringOtherApps])
-        usleep(250_000)
-    }
-    if let p = point {
-        guard let m = CGEvent(mouseEventSource: src, mouseType: .mouseMoved,
-                              mouseCursorPosition: p, mouseButton: .left) else {
-            throw CUAError.eventFailed("鼠标移动事件创建失败")
-        }
-        m.post(tap: .cghidEventTap)
-        usleep(60_000)
-    }
+    // 不激活目标、不动真实光标、不经过全局 HID。
+    // 全局 HID 需要目标在前台，而把目标拽到前台会打断用户正在输入的窗口，
+    // 代价不可接受；这里改为把滚轮事件直接投递给目标进程。
+    // 代价是部分应用（访达的列表视图）忽略进程内滚轮，
+    // 此时滚不动就如实报失败，由调用方决定要不要切前台。
+    let beforeSig = scrollSignature(AXUIElementCreateApplication(pid))
 
     let unit: Double = 10 * 53 // 一页约 530 点
     var dy: Int32 = 0
@@ -1806,7 +1798,7 @@ func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) thr
                               wheelCount: 2, wheel1: d1, wheel2: d2, wheel3: 0) else { return }
         e.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase))
         e.setIntegerValueField(.scrollWheelEventScrollCount, value: 1)
-        e.post(tap: .cghidEventTap)
+        e.postToPid(pid)
     }
 
     // trackpad 风格序列：began(1) → changed(2)×N → ended(4)。
@@ -1822,6 +1814,14 @@ func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) thr
         usleep(16_000)
     }
     wheel(4, 0, 0)
+    usleep(240_000)
+    if let before = beforeSig,
+       let after = scrollSignature(AXUIElementCreateApplication(pid)), before == after {
+        throw CUAError.eventFailed(
+            "\(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "目标")的当前视图不接受后台滚动，"
+            + "内容没有移动。需要前台滚动时，请先把该窗口切到前面再试。"
+        )
+    }
 }
 
 // MARK: - 剪贴板粘贴
