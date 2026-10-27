@@ -319,6 +319,8 @@ EOF
 | 实时画面回显 | `RemoteHostedPIP*` 全套 | 已实现：对话页右上角 MJPEG 小窗 |
 | 后台输入 | `postToPid` + `syntheticallyActivateIfNeeded` | 已实现：`AXFrontmost` 合成激活，元素点击优先 `AXPress` |
 | 交互前定位 | `prepareToInteract` + `waitUntilHasPrimaryWindow` | 已实现：等主窗口出现后再动手，光标跟到元素中心 |
+| UI 稳定判定 | `waitForUIToSettle`：0.1s / 0.25s 双档，看 `AXElementBusyChanged` | 已实现：不忙 0.04s 轮询 + 静默 0.08s 即返回，忙时 0.25s |
+| 键盘布局 | 按当前布局反查 keycode | 已实现：命名键静态表 + 字符按布局反查 |
 | 锁屏处理 | Guardian + AuthorizationPlugin | 已实现：检测 + 唤醒 + 可选密码解锁 |
 | 应用级策略 | 组织策略 + 内置黑名单 | 已实现：白/黑名单按 bundleID 拦在分发层 |
 | 审批弹窗 | `createElicitation` + 4 级确认策略 | 无，依赖 harness 自身审批 |

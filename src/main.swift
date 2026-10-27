@@ -8,6 +8,7 @@
 import Foundation
 import ApplicationServices
 import AppKit
+import Carbon.HIToolbox
 import ScreenCaptureKit
 import CoreGraphics
 import ImageIO
@@ -863,13 +864,59 @@ func encodeJPEG(_ image: CGImage, quality: Double) -> Data? {
 /// 变化即返回，超时才落到上限。实测把边际成本从 292ms 降到 60-90ms。
 ///
 /// 不用 AXObserver：建观察者本身要几十毫秒，短操作上反而更慢。
-func waitForChange(pid: pid_t, timeout: TimeInterval = 0.04, poll: TimeInterval = 0.006) {
+// MARK: - UI settle
+//
+// 对应 Codex 的 ApplicationUIElement.waitForUIToSettle(delay:notificationDelay:includingScrollEvents:)。
+// 反汇编常量：0x101102e48 = 0.1（常规轮询），fmov d1,#0.25（检测到 loading 时加长），
+// 由 fcsel 按条件二选一。判据来自 AXElementBusyChanged / AXProgressIndicator / AXValueChanged。
+//
+// 早期实现只有固定 40ms 的焦点指纹比对，界面在转圈但没有焦点变化时会误判为「已稳定」。
+
+/// 应用当前是否在「忙」：有进度指示器，或焦点元素带 AXBusy。
+/// 逐帧遍历全树太贵，只查两个便宜信号。
+func appLooksBusy(_ appEl: AXUIElement) -> Bool {
+    if let f = attr(appEl, kAXFocusedUIElementAttribute as String),
+       CFGetTypeID(f) == AXUIElementGetTypeID() {
+        let el = f as! AXUIElement
+        if let busy = attr(el, "AXBusy" as String) as? Bool, busy { return true }
+    }
+    // 主窗口下有没有可见的进度指示器（一层广度受限的探测）
+    if let w = attr(appEl, kAXMainWindowAttribute as String),
+       CFGetTypeID(w) == AXUIElementGetTypeID() {
+        let win = w as! AXUIElement
+        var ref: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, "AXProgressIndicators" as CFString, &ref) == .success,
+           let list = ref as? [AXUIElement], !list.isEmpty {
+            return true
+        }
+    }
+    return false
+}
+
+/// 等到界面稳定。
+/// 判据不是「等固定时长」，而是「连续一段时间没有新变化且不在忙」：
+/// 不忙时 0.04s 一轮、静默 0.08s 即返回（比原来的固定 40ms 只慢一档）；
+/// 在忙时按 0.25s 一轮（Codex 的 notificationDelay），并重置静默计时。
+func waitForChange(pid: pid_t, timeout: TimeInterval = 1.5) {
     let appEl = AXUIElementCreateApplication(pid)
-    let before = focusedSignature(appEl)
+    var last = focusedSignature(appEl)
+    var quietSince = Date()
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-        usleep(useconds_t(poll * 1_000_000))
-        if focusedSignature(appEl) != before { return }
+        let busy = appLooksBusy(appEl)
+        usleep(busy ? 250_000 : 40_000)
+        let sig = focusedSignature(appEl)
+        if sig != last {
+            last = sig
+            quietSince = Date()
+            continue
+        }
+        if busy {
+            // 还在转圈：不算静默，继续等
+            quietSince = Date()
+            continue
+        }
+        if Date().timeIntervalSince(quietSince) >= 0.08 { return }
     }
 }
 
@@ -1163,6 +1210,48 @@ enum Overlay {
 
 // MARK: - 键码
 
+
+// MARK: - 键位解析
+//
+// Codex 的 performKeyboardAction 按**当前键盘布局**反查 virtual keycode，
+// 找不到时报 "Could not find key code for character: %C"。
+// 早期实现只有一张硬编码的 US 布局表，AZERTY / QWERTZ 下按键会全错位。
+// 现在：命名键（return/tab/方向键…）仍走静态表，可打印字符按布局实时反查。
+
+private var layoutKeyCache: [Character: CGKeyCode] = [:]
+
+func keyCodeForCharacter(_ ch: Character) -> CGKeyCode? {
+    if let cached = layoutKeyCache[ch] { return cached }
+    guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+          let prop = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+    else { return nil }
+    let cfData = unsafeBitCast(prop, to: CFData.self)
+    guard let bytes = CFDataGetBytePtr(cfData) else { return nil }
+    let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+    let want = Array(String(ch).utf16)
+
+    for code in 0..<128 {
+        for shifted in [false, true] {
+            var deadKeyState: UInt32 = 0
+            var length = 0
+            var chars = [UniChar](repeating: 0, count: 4)
+            let mods: UInt32 = shifted ? (UInt32(shiftKey >> 8) & 0xFF) : 0
+            let status = UCKeyTranslate(
+                layout, UInt16(code), UInt16(kUCKeyActionDown), mods,
+                UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit),
+                &deadKeyState, chars.count, &length, &chars
+            )
+            deadKeyState = 0
+            if status == noErr, length > 0, Array(chars[0..<length]) == want {
+                let kc = CGKeyCode(code)
+                layoutKeyCache[ch] = kc
+                return kc
+            }
+        }
+    }
+    return nil
+}
+
 let keyCodes: [String: CGKeyCode] = [
     "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
     "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
@@ -1191,8 +1280,15 @@ func modifierMask(_ name: String) -> CGEventFlags? {
 
 func postKey(pid: pid_t, key: String) throws {
     let tokens = key.lowercased().split(separator: "+").map(String.init)
-    guard let last = tokens.last, let code = keyCodes[last] else {
-        throw CUAError.badRequest("无法识别的按键: \(key)")
+    guard let last = tokens.last else { throw CUAError.badRequest("按键为空") }
+    // 命名键走静态表；单个可打印字符按当前布局反查
+    let code: CGKeyCode
+    if let named = keyCodes[last] {
+        code = named
+    } else if last.count == 1, let ch = last.first, let resolved = keyCodeForCharacter(ch) {
+        code = resolved
+    } else {
+        throw CUAError.badRequest("无法识别的按键: \(key)（当前布局下找不到对应键码）")
     }
     var flags: CGEventFlags = []
     for m in tokens.dropLast() {
