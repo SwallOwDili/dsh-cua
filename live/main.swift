@@ -123,67 +123,86 @@ func capturePreview(windowID: CGWindowID) -> (data: Data, width: Int, height: In
 
 final class LiveState {
     private let lock = NSLock()
-    private var target: Target?
-    private var latest: Data?
-    private var clients: [NWConnection] = []
-    private var sequence = 0
+    /// 同时被操作的多个窗口各存一份。键是 CGWindowID。
+    private var targets: [CGWindowID: Target] = [:]
+    private var frames: [CGWindowID: Frame] = [:]
     private var capturing = false
-    private var frameWidth = 0
-    private var frameHeight = 0
-    /// 连续抓不到帧的次数。窗口关掉或最小化后，旧帧会一直挂在 latest 上，
-    /// 前端看起来像「画面卡住」；超过阈值就判定内容失效，让前端切到占位。
-    private var missStreak = 0
     private let missLimit = 5
+
+    struct Frame {
+        var jpeg: Data
+        var seq: Int
+        var width: Int
+        var height: Int
+        var missStreak: Int
+    }
+
+    /// 客户端订阅：一条连接只收它指定的窗口（nil 表示收任意窗口）。
+    private var clients: [(conn: NWConnection, window: CGWindowID?)] = []
 
     func setTarget(pid: pid_t, appName: String, ttl: Double, explicit: CGWindowID?) {
         guard let wid = explicit ?? windowID(for: pid) else { return }
         lock.lock()
-        let changed = target?.pid != pid || target?.windowID != wid
-        target = Target(
+        let existed = targets[wid] != nil
+        targets[wid] = Target(
             pid: pid,
             appName: appName,
             windowID: wid,
             expiresAt: Date().addingTimeInterval(ttl)
         )
         lock.unlock()
-        if changed {
-            FileHandle.standardError.write(Data("[cua-live] 目标切换到 \(appName) pid=\(pid) win=\(wid)\n".utf8))
+        if !existed {
+            FileHandle.standardError.write(Data("[cua-live] 新增目标 \(appName) pid=\(pid) win=\(wid)\n".utf8))
         }
     }
 
     func clear() {
         lock.lock()
-        target = nil
-        latest = nil
-        let victims = clients
+        targets.removeAll()
+        frames.removeAll()
+        let victims = clients.map { $0.conn }
         clients.removeAll()
         lock.unlock()
         for c in victims { c.cancel() }
     }
 
-    /// 当前有效目标；过期则自动清空。
-    func activeTarget() -> Target? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let t = target else { return nil }
-        if Date() >= t.expiresAt {
-            target = nil
-            latest = nil
-            return nil
+    /// 清理过期目标与失效帧。
+    private func sweepLocked() {
+        let now = Date()
+        for (wid, t) in targets where now >= t.expiresAt {
+            targets.removeValue(forKey: wid)
+            frames.removeValue(forKey: wid)
         }
-        return t
     }
 
+    /// 当前所有有效目标。
+    func activeTargets() -> [Target] {
+        lock.lock()
+        defer { lock.unlock() }
+        sweepLocked()
+        return targets.values.sorted { $0.windowID < $1.windowID }
+    }
+
+    func activeTarget(window: CGWindowID?) -> Target? {
+        lock.lock()
+        defer { lock.unlock() }
+        sweepLocked()
+        if let w = window { return targets[w] }
+        return targets.values.max { $0.expiresAt < $1.expiresAt }
+    }
+
+    /// 挑一个还没在抓的窗口交出去。调用方抓完调 endCapture。
     func beginCapture() -> Target? {
         lock.lock()
         defer { lock.unlock() }
+        sweepLocked()
         if capturing { return nil }
-        // 没有目标时不能置位：调用方的 defer 注册在 guard 之后，
-        // 一旦在这里置了 capturing，guard 失败直接 return 就再也不会复位，
-        // 抓帧永久停摆（2026-10-27 踩过）。
-        guard let t = target else { return nil }
+        // 轮转：优先抓没有帧或帧最旧的窗口
+        guard let next = targets.values.min(by: {
+            (frames[$0.windowID]?.seq ?? -1) < (frames[$1.windowID]?.seq ?? -1)
+        }) else { return nil }
         capturing = true
-        return t
+        return next
     }
 
     func endCapture() {
@@ -192,48 +211,43 @@ final class LiveState {
         lock.unlock()
     }
 
-    func noteMiss() {
+    func noteMiss(window: CGWindowID) {
         lock.lock()
-        missStreak += 1
-        if missStreak >= missLimit {
-            latest = nil
-            frameWidth = 0
-            frameHeight = 0
+        defer { lock.unlock() }
+        guard var f = frames[window] else { return }
+        f.missStreak += 1
+        if f.missStreak >= missLimit {
+            frames.removeValue(forKey: window)
+        } else {
+            frames[window] = f
         }
-        lock.unlock()
     }
 
     func publish(_ jpeg: Data, target: Target, width: Int, height: Int) {
         lock.lock()
-        missStreak = 0
-        frameWidth = width
-        frameHeight = height
-        guard let current = self.target,
-              current.windowID == target.windowID,
-              Date() < current.expiresAt else {
+        guard let current = targets[target.windowID], Date() < current.expiresAt else {
             lock.unlock()
             return
         }
-        latest = jpeg
-        sequence += 1
-        let recipients = clients
+        let seq = (frames[target.windowID]?.seq ?? 0) + 1
+        frames[target.windowID] = Frame(jpeg: jpeg, seq: seq, width: width, height: height, missStreak: 0)
+        let recipients = clients.filter { $0.window == nil || $0.window == target.windowID }
         lock.unlock()
 
         guard !recipients.isEmpty else { return }
         var chunk = Data("--\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(jpeg.count)\r\n\r\n".utf8)
         chunk.append(jpeg)
         chunk.append(Data("\r\n".utf8))
-        for conn in recipients {
-            conn.send(content: chunk, completion: .contentProcessed { _ in })
-        }
+        for c in recipients { c.conn.send(content: chunk, completion: .contentProcessed { _ in }) }
     }
 
-    func addClient(_ conn: NWConnection) {
+    func addClient(_ conn: NWConnection, window: CGWindowID?) {
         lock.lock()
-        clients.append(conn)
-        let current = latest
+        clients.append((conn, window))
+        let seed = window.flatMap { frames[$0]?.jpeg }
+            ?? frames.values.max { $0.seq < $1.seq }?.jpeg
         lock.unlock()
-        if let frame = current {
+        if let frame = seed {
             var chunk = Data("--\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(frame.count)\r\n\r\n".utf8)
             chunk.append(frame)
             chunk.append(Data("\r\n".utf8))
@@ -243,7 +257,7 @@ final class LiveState {
 
     func removeClient(_ conn: NWConnection) {
         lock.lock()
-        clients.removeAll { $0 === conn }
+        clients.removeAll { $0.conn === conn }
         lock.unlock()
     }
 
@@ -253,11 +267,33 @@ final class LiveState {
         return clients.count
     }
 
-    /// 返回 (字节数, 序号, 宽, 高)。宽高为 0 表示当前没有可用画面。
-    func frameInfo() -> (bytes: Int, seq: Int, width: Int, height: Int) {
+    func frameInfo(window: CGWindowID?) -> (bytes: Int, seq: Int, width: Int, height: Int) {
         lock.lock()
         defer { lock.unlock() }
-        return (latest?.count ?? 0, sequence, frameWidth, frameHeight)
+        let f: Frame?
+        if let w = window { f = frames[w] } else { f = frames.values.max { $0.seq < $1.seq } }
+        guard let f = f else { return (0, 0, 0, 0) }
+        return (f.jpeg.count, f.seq, f.width, f.height)
+    }
+
+    /// 每个目标加上帧信息，供 /status 一次性返回。
+    func snapshot() -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        sweepLocked()
+        return targets.values.sorted { $0.windowID < $1.windowID }.map { t in
+            let f = frames[t.windowID]
+            return [
+                "app": t.appName,
+                "pid": Int(t.pid),
+                "window": Int(t.windowID),
+                "alive": f != nil,
+                "bytes": f?.jpeg.count ?? 0,
+                "seq": f?.seq ?? 0,
+                "width": f?.width ?? 0,
+                "height": f?.height ?? 0,
+            ]
+        }
     }
 }
 
@@ -356,23 +392,15 @@ func handleConnection(_ conn: NWConnection) {
 
         switch (method, route) {
         case (_, "/status"):
-            let t = state.activeTarget()
-            let info = state.frameInfo()
-            let t2 = state.activeTarget()
+            let list = state.snapshot()
             conn.send(content: jsonResponse([
-                "active": t2 != nil,
-                "alive": info.bytes > 0,
-                "app": t2?.appName ?? "",
-                "pid": t2.map { Int($0.pid) } ?? 0,
-                "seq": info.seq,
-                "bytes": info.bytes,
-                "width": info.width,
-                "height": info.height,
+                "active": !list.isEmpty,
+                "targets": list,
                 "viewers": state.clientCount(),
             ]), completion: .contentProcessed { _ in conn.cancel() })
 
         case (_, "/focus"):
-            guard let t = state.activeTarget() else {
+            guard let t = state.activeTarget(window: params["window"].flatMap { CGWindowID($0) }) else {
                 conn.send(content: jsonResponse(["ok": false, "reason": "当前没有操作目标"]),
                           completion: .contentProcessed { _ in conn.cancel() })
                 break
@@ -397,10 +425,11 @@ func handleConnection(_ conn: NWConnection) {
                 let explicit = params["window"].flatMap { CGWindowID($0) }
                 state.setTarget(pid: pid, appName: app, ttl: ttl, explicit: explicit)
             }
-            let t = state.activeTarget()
+            let t = state.activeTarget(window: params["window"].flatMap { CGWindowID($0) })
             conn.send(content: jsonResponse([
                 "ok": t != nil,
                 "app": t?.appName ?? "",
+                "window": t.map { Int($0.windowID) } ?? 0,
             ]), completion: .contentProcessed { _ in conn.cancel() })
 
         case (_, "/clear"):
@@ -410,7 +439,7 @@ func handleConnection(_ conn: NWConnection) {
 
         case (_, "/live.mjpg"):
             conn.send(content: mjpegHeader(), completion: .contentProcessed { _ in })
-            state.addClient(conn)
+            state.addClient(conn, window: params["win"].flatMap { CGWindowID($0) })
             conn.stateUpdateHandler = { newState in
                 switch newState {
                 case .failed, .cancelled:
@@ -440,7 +469,7 @@ pumpTimer.setEventHandler {
     if let frame = capturePreview(windowID: target.windowID) {
         state.publish(frame.data, target: target, width: frame.width, height: frame.height)
     } else {
-        state.noteMiss()
+        state.noteMiss(window: target.windowID)
     }
 }
 pumpTimer.resume()

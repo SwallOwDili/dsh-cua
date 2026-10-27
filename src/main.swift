@@ -2787,6 +2787,11 @@ func errorResponse(_ id: Any?, _ code: Int, _ message: String) -> [String: Any] 
 }
 
 func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
+    if ProcessInfo.processInfo.environment["CUA_DEBUG_RPC"] != nil, method == "tools/call" {
+        let keys = params.keys.sorted().joined(separator: ",")
+        let meta = (params["_meta"] as? [String: Any]).map { "\($0)" } ?? "nil"
+        FileHandle.standardError.write(Data("rpc: keys=[\(keys)] meta=\(meta)\n".utf8))
+    }
     switch method {
     case "initialize":
         return [

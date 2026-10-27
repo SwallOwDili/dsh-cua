@@ -113,6 +113,19 @@ final class CursorView: NSView {
     }
 }
 
+
+/// 目标窗口是否仍在屏幕上（未关闭、未最小化）。
+func windowOnScreen(_ id: CGWindowID) -> Bool {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return false
+    }
+    for info in list where (info[kCGWindowNumber as String] as? UInt32) == id {
+        return true
+    }
+    return false
+}
+
 final class CursorController {
     private let win = CursorWindow()
     private let view = CursorView()
@@ -146,10 +159,12 @@ final class CursorController {
         win.order(.above, relativeTo: Int(targetWindowID))
     }
 
-    /// 目标应用不在前台就不显示光标。
+    /// 只要目标窗口还在屏上就显示光标。
+    /// 不看前台：AI 操作后台窗口时，用户仍要能看到光标停在哪里。
+    /// 目标被遮挡时，光标因为挂在目标窗口层级上，会跟着一起被遮挡。
     private func targetAllowsDisplay() -> Bool {
-        guard targetPID != 0 else { return true }
-        return NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID
+        guard targetPID != 0, targetWindowID != 0 else { return true }
+        return windowOnScreen(CGWindowID(targetWindowID))
     }
 
     func move(to p: CGPoint, animated: Bool) {
@@ -451,26 +466,17 @@ final class OverlayController {
             return
         }
 
-        // 目标应用不再是前台时，不再把标记顶在最上层
-        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
-        let targetIsFront = (frontmostPID == targetPID)
-
-        if targetIsFront {
-            if hiddenByOcclusion {
-                hiddenByOcclusion = false
-                layout(for: rect)
-                window.orderFrontRegardless()
-                window.order(.above, relativeTo: Int(id))
-            } else {
-                layout(for: rect)
-            }
-        } else {
-            // 目标在后台：隐藏标记。窗口本身不可见，标记也不该浮在别人上面。
-            if !hiddenByOcclusion {
-                hiddenByOcclusion = true
-                window.orderOut(nil)
-            }
+        // 标记属于那个窗口，不属于屏幕。
+        // 之前按「目标是否前台」决定显示/隐藏，结果是用户在浏览器里看 AI 操作
+        // 后台应用时，标记整个消失，看不出 AI 在哪动手。
+        // 正确做法是始终显示，并挂在目标窗口之上：
+        // 目标被别的窗口盖住时，标记跟着被盖住，不会浮在最上层。
+        layout(for: rect)
+        if !window.isVisible || hiddenByOcclusion {
+            hiddenByOcclusion = false
+            window.orderFrontRegardless()
         }
+        window.order(.above, relativeTo: Int(id))
     }
 }
 

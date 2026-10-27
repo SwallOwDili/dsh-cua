@@ -332,11 +332,18 @@ window.__ModuleLoader__.load({
     const LIVE_BASE = 'http://127.0.0.1:18901'
 
     const liveCss = {
+      // 多个目标纵向排列，每个小窗独立
+      stack: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+        alignItems: 'flex-end',
+      },
       wrap: {
         position: 'relative',
         display: 'inline-flex',
         alignItems: 'center',
-        marginRight: '8px',
+        cursor: 'pointer',
       },
       frame: {
         width: '184px',
@@ -409,58 +416,68 @@ window.__ModuleLoader__.load({
 
       if (!status) return null
 
-      // 高度按真实帧比例算：目标窗口换形状时小窗跟着变形，
-      // 而不是把内容硬塞进固定的 184×? 里。
-      const fw = status.width > 0 ? status.width : 0
-      const fh = status.height > 0 ? status.height : 0
-      const ratio = fw > 0 && fh > 0 ? fh / fw : 0.62
+      // 多目标：同时被操作的每个窗口各出一个小窗，
+      // 从上到下排列，不合并、不互相覆盖。
+      const targets = Array.isArray(status.targets) ? status.targets : []
+      if (targets.length === 0) return null
+
       const boxW = 184
-      const boxH = Math.max(56, Math.min(220, Math.round(boxW * ratio)))
 
-      const body = status.alive
-        ? React.createElement('img', {
-            // pid 参与查询串：目标切换时强制重连到新流
-            src: LIVE_BASE + '/live.mjpg?t=' + status.pid,
-            style: Object.assign({}, liveCss.frame, { width: boxW + 'px', height: boxH + 'px', objectFit: 'fill' }),
-            alt: '实时操作画面',
-          })
-        : React.createElement(
-            'div',
-            {
-              // 目标窗口关闭或最小化：不挂一张旧帧冒充实时画面，
-              // 换成占位格（对应 Codex 的 CheckerboardRenderer）
-              style: Object.assign({}, liveCss.checker, { width: boxW + 'px', height: boxH + 'px' }),
-              title: '目标窗口当前不可见',
-            },
-            '画面暂不可用',
-          )
+      const frameFor = (t) => {
+        const fw = t.width > 0 ? t.width : 0
+        const fh = t.height > 0 ? t.height : 0
+        const ratio = fw > 0 && fh > 0 ? fh / fw : 0.62
+        const boxH = Math.max(56, Math.min(220, Math.round(boxW * ratio)))
+        return { width: boxW + 'px', height: boxH + 'px' }
+      }
 
-      // 点击小窗直接跳到被操作的那个窗口。
-      // 与后台操作相反：这是用户主动要看，就该把窗口提到前面。
-      const focusTarget = () => {
-        if (!status.active) return
-        fetch(LIVE_BASE + '/focus', { cache: 'no-store' }).catch(() => {})
+      const focusTarget = (t) => {
+        fetch(LIVE_BASE + '/focus?window=' + t.window, { cache: 'no-store' }).catch(() => {})
       }
 
       return React.createElement(
         'div',
-        {
-          style: Object.assign({}, liveCss.wrap, status.active ? { cursor: 'pointer' } : null),
-          title: status.active ? '点击跳到这个窗口' : 'AI 正在操作的窗口（实时）',
-          onClick: focusTarget,
-          role: status.active ? 'button' : undefined,
-          tabIndex: status.active ? 0 : undefined,
-          onKeyDown: (e) => {
-            if (e.key === 'Enter' || e.key === ' ') focusTarget()
-          },
-        },
-        body,
-        React.createElement(
-          'span',
-          { style: liveCss.tag },
-          React.createElement('span', { style: liveCss.dot }),
-          status.app || '未知应用',
-        ),
+        { style: liveCss.stack },
+        targets.map((t) => {
+          const box = frameFor(t)
+          const body = t.alive
+            ? React.createElement('img', {
+                // win 参与查询串：同一窗口重新出现时强制重连
+                src: LIVE_BASE + '/live.mjpg?win=' + t.window + '&t=' + t.seq,
+                style: Object.assign({}, liveCss.frame, box, { objectFit: 'fill' }),
+                alt: '实时操作画面',
+              })
+            : React.createElement(
+                'div',
+                {
+                  style: Object.assign({}, liveCss.checker, box),
+                  title: '目标窗口当前不可见',
+                },
+                '画面暂不可用',
+              )
+
+          return React.createElement(
+            'div',
+            {
+              key: String(t.window),
+              style: liveCss.wrap,
+              title: '点击跳到这个窗口',
+              onClick: () => focusTarget(t),
+              role: 'button',
+              tabIndex: 0,
+              onKeyDown: (e) => {
+                if (e.key === 'Enter' || e.key === ' ') focusTarget(t)
+              },
+            },
+            body,
+            React.createElement(
+              'span',
+              { style: liveCss.tag },
+              React.createElement('span', { style: liveCss.dot }),
+              t.app || '未知应用',
+            ),
+          )
+        }),
       )
     }
 
