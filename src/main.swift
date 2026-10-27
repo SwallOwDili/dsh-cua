@@ -2827,6 +2827,10 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
         if let meta = params["_meta"] as? [String: Any],
            let sid = meta["sessionId"] as? String {
             currentSessionID = sid
+        } else if let env = ProcessInfo.processInfo.environment["CUA_SESSION"], !env.isEmpty {
+            // 外部脚本不经过插件、没法发 _meta，用环境变量声明会话，
+            // 这样它自己的预览仍然落在它该在的页面里。
+            currentSessionID = env
         }
         let args = (params["arguments"] as? [String: Any]) ?? [:]
         // 锁屏时所有依赖 AX / 截屏 / 注入的工具都会失败，先给准确原因
