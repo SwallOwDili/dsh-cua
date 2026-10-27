@@ -6,7 +6,7 @@
 //
 // 窗口特性：
 //   - borderless + 透明背景 + 忽略鼠标事件（不阻挡用户操作）
-//   - level = .statusBar，盖在目标窗口之上
+//   - level = .normal，与虚拟光标同层，靠 order(above:) 贴在目标窗口上
 //   - canJoinAllSpaces + fullScreenAuxiliary，全屏与切换 Space 时跟随
 //   - 每 0.25s 轮询目标窗口 bounds，窗口移动/缩放时同步
 //
@@ -29,7 +29,9 @@ final class CursorWindow: NSWindow {
         backgroundColor = .clear
         hasShadow = false
         ignoresMouseEvents = true
-        level = .statusBar
+        // 与「AI 正在操作」胶囊同层。用 .statusBar 会盖在所有普通窗口之上，
+        // 目标被别的窗口遮住时光标还浮着，视觉上就"飘在天上"。
+        level = .normal
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         isMovable = false
         isReleasedWhenClosed = false
@@ -119,6 +121,10 @@ final class CursorController {
     private var animStart: Date?
     private var timer: Timer?
     private var expiresAt: Date = .distantPast
+    /// 目标窗口与所属进程：光标只在目标应用位于前台时显示，
+    /// 跟胶囊标记同一套规则——不能比标记「更飘」。
+    var targetPID: pid_t = 0
+    var targetWindowID: CGWindowID = 0
 
     init() {
         win.contentView = view
@@ -131,17 +137,36 @@ final class CursorController {
         return NSRect(x: p.x, y: h - p.y - 64, width: 64, height: 64)
     }
 
+    /// 把光标窗口排到目标窗口正上方。level 已降到 .normal，
+    /// 所以别的窗口盖住目标时，光标跟着被盖住，不会浮在所有窗口之上。
+    private func attachToTarget() {
+        // 先上屏再排序：order(.above:) 不负责显示隐藏窗口
+        win.orderFrontRegardless()
+        guard targetWindowID != 0 else { return }
+        win.order(.above, relativeTo: Int(targetWindowID))
+    }
+
+    /// 目标应用不在前台就不显示光标。
+    private func targetAllowsDisplay() -> Bool {
+        guard targetPID != 0 else { return true }
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID
+    }
+
     func move(to p: CGPoint, animated: Bool) {
         expiresAt = Date().addingTimeInterval(20)
+        guard targetAllowsDisplay() else {
+            hide()
+            return
+        }
         let target = frame(at: p)
         if !animated || !win.isVisible {
             from = NSPoint(x: target.minX, y: target.minY)
             win.setFrame(target, display: true)
-            win.orderFrontRegardless()
+            attachToTarget()
             animStart = nil
         } else {
             // TTL 隐藏后回到动画路径时必须重新上屏，否则动画在屏外跑
-            if !win.isVisible { win.orderFrontRegardless() }
+            if !win.isVisible { attachToTarget() }
             from = NSPoint(x: win.frame.minX, y: win.frame.minY)
             to = NSPoint(x: target.minX, y: target.minY)
             animStart = Date()
@@ -156,6 +181,7 @@ final class CursorController {
     }
 
     func click(at p: CGPoint) {
+        guard targetAllowsDisplay() else { return }
         move(to: p, animated: false)
         view.clickPulseStart = Date()
         expiresAt = Date().addingTimeInterval(20)
@@ -173,6 +199,7 @@ final class CursorController {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             if Date() >= self.expiresAt { self.hide(); return }
+            if !self.targetAllowsDisplay() { self.hide(); return }
             if let t0 = self.animStart {
                 let k = min(1, Date().timeIntervalSince(t0) / 0.28)
                 let e = 1 - pow(1 - CGFloat(k), 3)   // easeOutCubic
@@ -287,7 +314,7 @@ final class OverlayWindow: NSWindow {
         backgroundColor = .clear
         hasShadow = false
         ignoresMouseEvents = true
-        level = .statusBar
+        level = .normal
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         isMovable = false
         isReleasedWhenClosed = false
@@ -367,7 +394,11 @@ final class OverlayController {
             return
         }
         layout(for: rect)
+        // 先上屏，再贴到目标窗口正上方。
+        // order(.above:) 只调整 z 序，对隐藏窗口不产生显示效果，
+        // 所以两步都要做；只用 orderFrontRegardless 会让胶囊浮在所有窗口之上。
         window.orderFrontRegardless()
+        window.order(.above, relativeTo: Int(windowID))
         hiddenByOcclusion = false
 
         timer?.invalidate()
@@ -429,6 +460,7 @@ final class OverlayController {
                 hiddenByOcclusion = false
                 layout(for: rect)
                 window.orderFrontRegardless()
+                window.order(.above, relativeTo: Int(id))
             } else {
                 layout(for: rect)
             }
@@ -540,6 +572,9 @@ final class CommandServer {
                         let label = (obj["label"] as? String) ?? "AI 正在操作"
                         let pid = pid_t((obj["pid"] as? Int) ?? 0)
                         let ttl = (obj["ttl"] as? Double) ?? 20
+                        // 光标与胶囊共用同一个目标：同层、同显示条件
+                        self.cursor.targetPID = pid
+                        self.cursor.targetWindowID = CGWindowID(wid)
                         self.controller.show(
                             windowID: CGWindowID(wid),
                             label: label,
@@ -549,6 +584,7 @@ final class CommandServer {
                     }
                 case "hide":
                     self.controller.hide()
+                    self.cursor.hide()
                 default:
                     break
                 }

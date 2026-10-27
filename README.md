@@ -219,6 +219,12 @@ Codex 的对应实现是 `SyntheticAppFocusEnforcer`，它的 State 有三个独
 `NSWorkspace.frontmostApplication` 不变——正是 Codex `syntheticallyActivateIfNeeded` 的效果。
 窗口级 `AXMain`、应用级 `AXFocused` 都不碰，那些会真的把窗口升起。
 
+**标记与光标同层。** 两个窗口都用 `.normal` 而不是 `.statusBar`——
+后者会盖在所有普通窗口之上，目标被别的窗口遮住时标记还浮着。
+显示时先 `orderFrontRegardless` 再 `order(.above, relativeTo: 目标窗口号)`，
+让它们贴在目标窗口正上方，别的窗口盖住目标时一起被盖住。
+两者共用同一个目标与显示条件：目标应用不在前台，胶囊和光标同时消失。
+
 **元素点击优先 AXPress。** 鼠标事件即使定向投递到 pid，被点的应用也会当成真实点击、
 自己把窗口激活上来。AXPress 是纯 AX 动作，不经过事件系统。实测点 `AXMenuButton` 前后
 系统前台不变；而按坐标点击无法避免激活——那是真点击，属于 macOS 固有行为。
