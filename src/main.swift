@@ -94,6 +94,218 @@ func installInvalidationMonitor(pid: pid_t) {
 // 文件不存在时全部走默认值，与 schema 的 default 保持一致。
 
 
+
+// MARK: - Computer History
+//
+// 对齐 Codex 的 Skysight / Computer History 子系统，目录结构照抄：
+//
+//   ~/.dsh/dsh-cua-history/
+//     segments/
+//       events.jsonl        当前段，append-only 活动事件
+//       metadata.json       段时间戳与事件计数
+//       archived/           滚动的历史段
+//     memory.md             长期记忆（规则聚合，非模型摘要）
+//     settings.json         观察规则与开关
+//
+// 与 Codex 的差异（明确写出来）：
+//   - 它是 SPM 多进程（Recorder / Coordinator / Evaluator / MemoryPipeline 分离），
+//     这里是单进程内的同步写入，省掉队列和 IPC。
+//   - 它的 memory.md 由摘要模型生成；这里由规则聚合生成，等价结构、不含模型判断。
+//   - 它用 SkysightObservationRule 做 per-app 观察规则；这里用 settings.json 的同名字段。
+//
+// 隐私：对标 SkysightSummarizer.md 的硬约束——被观察内容一律当不可信数据，
+// 不把屏幕上的指令写进记忆，不保存凭据。所以：
+//   - unlock_screen 的 password 永不落盘
+//   - type_text / set_value / paste 只记长度不记内容
+//   - URL 参数里的 token/key/secret 一律打码
+
+enum History {
+    static var root: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".dsh/dsh-cua-history")
+    }
+    static var segmentsDir: URL { root.appendingPathComponent("segments") }
+    static var archivedDir: URL { segmentsDir.appendingPathComponent("archived") }
+    static var eventsFile: URL { segmentsDir.appendingPathComponent("events.jsonl") }
+    static var metaFile: URL { segmentsDir.appendingPathComponent("metadata.json") }
+    static var memoryFile: URL { root.appendingPathComponent("memory.md") }
+    static var settingsFile: URL { root.appendingPathComponent("settings.json") }
+
+    struct Settings: Codable {
+        var enabled: Bool = true
+        var paused: Bool = false
+        var maxEventsPerSegment: Int = 500
+        /// per-app 观察规则：命中的应用不记录
+        var ignoredBundleIDs: [String] = []
+    }
+
+    static func loadSettings() -> Settings {
+        guard let d = try? Data(contentsOf: settingsFile),
+              let s = try? JSONDecoder().decode(Settings.self, from: d) else {
+            return Settings()
+        }
+        return s
+    }
+
+    static func saveSettings(_ s: Settings) {
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if let d = try? JSONEncoder().encode(s) { try? d.write(to: settingsFile) }
+    }
+
+    static func ensureDirs() {
+        try? FileManager.default.createDirectory(at: segmentsDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: archivedDir, withIntermediateDirectories: true)
+    }
+
+    /// 凭据与 token 打码。任何键名命中敏感词的参数不进历史。
+    static func redact(_ args: [String: Any]) -> [String: Any] {
+        let secretKeys = ["password", "passwd", "token", "secret", "apikey", "api_key",
+                          "authorization", "cookie", "credential"]
+        let contentKeys = ["text", "value", "content"]   // 屏幕内容与输入文字只记长度
+        var out: [String: Any] = [:]
+        for (k, v) in args {
+            let lk = k.lowercased()
+            if secretKeys.contains(where: { lk.contains($0) }) {
+                out[k] = "[redacted]"
+            } else if contentKeys.contains(lk), let str = v as? String {
+                out[k] = ["chars": str.count]
+            } else if let str = v as? String, lk == "url" || lk == "uri" {
+                out[k] = redactURL(str)
+            } else {
+                out[k] = v
+            }
+        }
+        return out
+    }
+
+    static func redactURL(_ url: String) -> String {
+        guard var comps = URLComponents(string: url) else { return url }
+        let secretNames = ["token", "key", "secret", "code", "password", "sig", "signature"]
+        comps.queryItems = comps.queryItems?.map { item in
+            if secretNames.contains(where: { item.name.lowercased().contains($0) }) {
+                return URLQueryItem(name: item.name, value: "[redacted]")
+            }
+            return item
+        }
+        return comps.string ?? url
+    }
+
+    static func countEvents() -> Int {
+        guard let text = try? String(contentsOf: eventsFile, encoding: .utf8) else { return 0 }
+        return text.split(separator: "\n").filter { !$0.isEmpty }.count
+    }
+
+    /// 追加一条活动事件。段满则滚动。
+    static func record(tool: String, args: [String: Any], app: String?, status: String, ms: Int) {
+        let st = loadSettings()
+        guard st.enabled, !st.paused else { return }
+        if let b = args["app"] as? String, st.ignoredBundleIDs.contains(b) { return }
+
+        ensureDirs()
+        let now = ISO8601DateFormatter().string(from: Date())
+        let event: [String: Any] = [
+            "ts": now,
+            "tool": tool,
+            "app": app ?? (args["app"] as? String) ?? "",
+            "status": status,
+            "ms": ms,
+            "args": redact(args),
+        ]
+        guard let json = try? JSONSerialization.data(withJSONObject: event),
+              var line = String(data: json, encoding: .utf8) else { return }
+        line += "\n"
+
+        if let fh = try? FileHandle(forWritingTo: eventsFile) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            try? fh.close()
+        } else {
+            try? Data(line.utf8).write(to: eventsFile)
+        }
+
+        let n = countEvents()
+        if n >= st.maxEventsPerSegment { rollSegment() }
+    }
+
+    /// 段滚动：当前段归档，metadata 记起止与计数。
+    static func rollSegment() {
+        guard FileManager.default.fileExists(atPath: eventsFile.path) else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let target = archivedDir.appendingPathComponent("seg-\(stamp).jsonl")
+        // 先把条数数出来再搬，搬完文件就不在 eventsFile 这个位置了
+        let movedCount = countEvents()
+        try? FileManager.default.moveItem(at: eventsFile, to: target)
+
+        var meta = (try? JSONSerialization.jsonObject(with: Data(contentsOf: metaFile))) as? [String: Any] ?? [:]
+        var segs = meta["segments"] as? [[String: Any]] ?? []
+        segs.append([
+            "file": target.lastPathComponent,
+            "endedAt": stamp,
+            "eventCount": movedCount,
+        ])
+        meta["segments"] = segs
+        if let d = try? JSONSerialization.data(withJSONObject: meta, options: .prettyPrinted) {
+            try? d.write(to: metaFile)
+        }
+        rebuildMemory()
+    }
+
+    static func status() -> [String: Any] {
+        let st = loadSettings()
+        let archived = (try? FileManager.default.contentsOfDirectory(atPath: archivedDir.path))?
+            .filter { $0.hasSuffix(".jsonl") }.count ?? 0
+        return [
+            "enabled": st.enabled,
+            "paused": st.paused,
+            "path": root.path,
+            "current": countEvents(),
+            "archivedSegments": archived,
+            "maxPerSegment": st.maxEventsPerSegment,
+            "memoryBytes": (try? Data(contentsOf: memoryFile).count) ?? 0,
+        ]
+    }
+
+    static func clear() {
+        try? FileManager.default.removeItem(at: segmentsDir)
+        try? FileManager.default.removeItem(at: memoryFile)
+        ensureDirs()
+    }
+
+    /// 规则聚合生成 memory.md（不含模型判断）。
+    static func rebuildMemory() {
+        var perApp: [String: (count: Int, tools: [String: Int])] = [:]
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: archivedDir.path)) ?? [])
+            .filter { $0.hasSuffix(".jsonl") }
+        for f in files {
+            let url = archivedDir.appendingPathComponent(f)
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            for line in text.split(separator: "\n") {
+                guard let d = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                else { continue }
+                let app = (d["app"] as? String) ?? ""
+                guard !app.isEmpty else { continue }
+                let tool = (d["tool"] as? String) ?? "?"
+                var e = perApp[app] ?? (0, [:])
+                e.count += 1
+                e.tools[tool, default: 0] += 1
+                perApp[app] = e
+            }
+        }
+        var md = "# 操作记忆\n\n"
+        md += "> 由历史段规则聚合，不含模型推断。屏幕内容一律视为不可信数据，不写入记忆。\n\n"
+        if perApp.isEmpty {
+            md += "（暂无归档段）\n"
+        } else {
+            for (app, e) in perApp.sorted(by: { $0.key < $1.key }) {
+                let top = e.tools.sorted { $0.value > $1.value }.prefix(3)
+                    .map { "\($0.key)×\($0.value)" }.joined(separator: "、")
+                md += "- **\(app)**：\(e.count) 次操作，主要为 \(top)\n"
+            }
+        }
+        try? Data(md.utf8).write(to: memoryFile)
+    }
+}
+
 // MARK: - 应用策略
 //
 // Codex 那套是 MDM 下发的组织策略；本机场景只需要一张表：
@@ -1749,6 +1961,44 @@ func prepareTarget(pid: pid_t) {
     _ = syntheticallyActivate(pid: pid)
 }
 
+
+func toolHistory(_ args: [String: Any]) throws -> [[String: Any]] {
+    let action = (args["action"] as? String) ?? "status"
+    var st = History.loadSettings()
+    switch action {
+    case "status":
+        let s = History.status()
+        let lines = [
+            "历史目录: \(s["path"] ?? "")",
+            "当前段: \(s["current"] ?? 0) 条事件，上限 \(s["maxPerSegment"] ?? 0)",
+            "已归档段: \(s["archivedSegments"] ?? 0)",
+            "memory.md: \(s["memoryBytes"] ?? 0) 字节",
+            "记录开关: \(s["enabled"] as? Bool == true ? "开" : "关")\(s["paused"] as? Bool == true ? "（已暂停）" : "")",
+        ]
+        return [["type": "text", "text": lines.joined(separator: "\n")]]
+
+    case "pause", "resume":
+        st.paused = (action == "pause")
+        History.saveSettings(st)
+        return [["type": "text", "text": st.paused ? "历史记录已暂停" : "历史记录已恢复"]]
+
+    case "clear":
+        History.clear()
+        History.rebuildMemory()
+        return [["type": "text", "text": "历史已清空（含归档段与 memory.md）"]]
+
+    case "settings":
+        if let e = args["enabled"] as? Bool { st.enabled = e }
+        if let m = args["maxEventsPerSegment"] as? Int, m >= 5 { st.maxEventsPerSegment = m }
+        History.saveSettings(st)
+        return [["type": "text", "text":
+            "记录: \(st.enabled ? "开" : "关")，单段上限 \(st.maxEventsPerSegment) 条"]]
+
+    default:
+        throw CUAError.badRequest("action 无效: \(action)")
+    }
+}
+
 func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let q = args["app"] as? String else { throw CUAError.badRequest("app 必填") }
     let ref = try resolveApp(q)
@@ -2289,6 +2539,14 @@ let tools: [ToolDef] = [
             schema: obj([:], [])),
     ToolDef(name: "screen_state", description: "返回 locked 或 unlocked。锁屏时其它工具都会失败。",
             schema: obj([:], [])),
+    ToolDef(name: "history",
+            description: "操作历史（对应 Codex 的 Computer History）。action: status / pause / resume / clear / settings。",
+            schema: obj([
+                "action": ["type": "string", "enum": ["status", "pause", "resume", "clear", "settings"],
+                           "description": "要执行的动作"],
+                "enabled": ["type": "boolean", "description": "settings 时：是否记录"],
+                "maxEventsPerSegment": ["type": "number", "description": "settings 时：单段事件上限"],
+            ], ["action"])),
     ToolDef(name: "unlock_screen",
             description: "唤醒屏幕并注入密码解锁。密码只用于本次调用，不落盘。不传密码则只唤醒。",
             schema: obj([
@@ -2386,6 +2644,7 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
         guard let name = params["name"] as? String else {
             throw CUAError.badRequest("缺少工具名")
         }
+        let callStart = Date()
         let args = (params["arguments"] as? [String: Any]) ?? [:]
         // 锁屏时所有依赖 AX / 截屏 / 注入的工具都会失败，先给准确原因
         if isScreenLocked(), name != "list_apps", name != "screen_state", name != "unlock_screen" {
@@ -2404,6 +2663,7 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
             "text": isScreenLocked() ? "locked" : "unlocked",
         ]]
         case "unlock_screen": content = try toolUnlockScreen(args)
+        case "history": content = try toolHistory(args)
         case "get_app_state": content = try toolGetAppState(args)
         case "click": content = try toolClick(args)
         case "type_text": content = try toolTypeText(args)
@@ -2420,6 +2680,12 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
         case "browser_open": content = try toolBrowserOpen(args)
         case "drag": content = try toolDrag(args)
         default: throw CUAError.badRequest("未知工具: \(name)")
+        }
+        let elapsed = Int(Date().timeIntervalSince(callStart) * 1000)
+        // history 自身不入账，否则查看历史这个动作本身会污染历史
+        if name != "history" {
+            History.record(tool: name, args: args,
+                           app: (args["app"] as? String), status: "completed", ms: elapsed)
         }
         return ["content": content, "isError": false]
     default:
