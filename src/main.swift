@@ -643,11 +643,21 @@ func captureTree(pid: pid_t, appName: String, diffMode: String = "none") -> Snap
             }
         }
 
-        let line = String(repeating: indentUnit, count: f.depth) + parts.joined(separator: " ")
-        lines.append(line)
-        collected.append((path: path, id: id, depth: f.depth, line: line))
-        if isFocused, focusedLine == nil {
-            focusedLine = line.trimmingCharacters(in: .whitespaces)
+        // 角色压平：对应 Codex 的 UIElementFlattenedRole。
+        // 既没有标题/描述/值/动作、也不是焦点的 AXGroup / AXGenericElement，
+        // 对模型没有信息量，只会增加缩进层数。这类容器不输出自己的行，
+        // 子节点原地提升一层——元素仍然注册（id 与路径不变），只是不占文本。
+        let isNoiseContainer = (role == "AXGroup" || role == "AXGenericElement")
+            && parts.count == 2 && !isFocused
+
+        let childDepth = isNoiseContainer ? f.depth : f.depth + 1
+        if !isNoiseContainer {
+            let rendered = String(repeating: indentUnit, count: f.depth) + parts.joined(separator: " ")
+            lines.append(rendered)
+            collected.append((path: path, id: id, depth: f.depth, line: rendered))
+            if isFocused, focusedLine == nil {
+                focusedLine = rendered.trimmingCharacters(in: .whitespaces)
+            }
         }
 
         let kids = childrenOf(f.el)
@@ -658,7 +668,7 @@ func captureTree(pid: pid_t, appName: String, diffMode: String = "none") -> Snap
             let kr = strAttr(k, kAXRoleAttribute as String) ?? "AXUnknown"
             let idx = roleCount[kr] ?? 0
             roleCount[kr] = idx + 1
-            childFrames.append(Frame(el: k, depth: f.depth + 1, path: path, roleIndex: idx))
+            childFrames.append(Frame(el: k, depth: childDepth, path: path, roleIndex: idx))
         }
         for cf in childFrames.reversed() {
             stack.append(cf)
