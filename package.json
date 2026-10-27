@@ -59,5 +59,10 @@
   "bugs": {
     "url": "https://github.com/SwallOwDili/dsh-cua/issues"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "bin": {
+    "cua-mcp": "./bin/cua-mcp",
+    "cua-live": "./bin/cua-live",
+    "cua-overlay": "./bin/cua-overlay"
+  }
 }

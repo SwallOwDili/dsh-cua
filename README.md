@@ -29,19 +29,37 @@ Elements: 122
 
 ## 安装
 
-作为 dsh 插件：
+仓库自带预编译二进制（arm64 + x86_64 通用），clone 下来就能用，不需要 Xcode。
 
 ```bash
-dsh plugin install https://github.com/SwallowDili/dsh-cua
+git clone https://github.com/SwallowDili/dsh-cua.git
 ```
 
-或本地目录：
+下面所有配置里的 `<仓库目录>` 都指你 clone 出来的这个路径，
+例如 `~/code/dsh-cua`。
+
+需要 macOS 14+。
+
+### 作为 dsh 插件
+
+把仓库放进 dsh 的 profile 目录：
 
 ```bash
-dsh plugin install /path/to/dsh-cua
+cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 ```
 
-需要 macOS 14+。装完在「设置 → 插件配置 → cua」里调整参数。
+`<profile>` 是你的 profile 名（默认 `web`）。重启 dsh 后，
+工具会出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
+
+### 作为独立 MCP 服务器
+
+不用 dsh，任何 MCP 客户端直接指向二进制：
+
+```bash
+<仓库目录>/bin/cua-mcp
+```
+
+它是个 stdio 服务器，不需要额外的运行环境。
 
 ## 授权
 
@@ -62,15 +80,26 @@ dsh plugin install /path/to/dsh-cua
 
 ### 任意 MCP 客户端
 
+先拿到二进制的绝对路径（在 clone 出来的目录里执行）：
+
+```bash
+echo "$(pwd)/bin/cua-mcp"
+```
+
+把输出填进 `command`。下面两处 `"/Users/you/code/dsh-cua"` 都是示例，换成你的实际路径：
+
 ```json
 {
   "mcpServers": {
     "computer-use": {
-      "command": "/path/to/dsh-cua/bin/cua-mcp"
+      "command": "/Users/you/code/dsh-cua/bin/cua-mcp"
     }
   }
 }
 ```
+
+装了 dsh 插件、想用 profile 里那份的话，路径是
+`~/.dsh/profiles/<profile>/node_modules/dsh-cua/bin/cua-mcp`。
 
 ### OpenCode
 
@@ -80,7 +109,7 @@ dsh plugin install /path/to/dsh-cua
   "mcp": {
     "computer-use": {
       "type": "local",
-      "command": ["/path/to/dsh-cua/bin/cua-mcp"],
+      "command": ["/Users/you/code/dsh-cua/bin/cua-mcp"],
       "enabled": true,
       "timeout": 120000,
       "environment": { "CUA_SESSION": "opencode" }
