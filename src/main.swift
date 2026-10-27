@@ -279,7 +279,20 @@ func resolveApp(_ query: String) throws -> AppRef {
     let fuzzy = apps.filter { ($0.localizedName ?? "").lowercased().contains(lower) }
     if fuzzy.count == 1 { return describe(fuzzy[0]) }
 
-    // 未运行：尝试拉起
+    // 上面只查了 activationPolicy == .regular 的应用。
+    // 菜单栏应用（ClashX、Tailscale、Spotlight 这类）是 .accessory，
+    // 明明在跑却被当成「未运行」，于是走拉起流程白等近一秒。
+    // 先在全量运行应用里按 bundleID / 名称再找一次。
+    let live = NSWorkspace.shared.runningApplications
+    if let a = live.first(where: { $0.bundleIdentifier == q }) { return describe(a) }
+    if let a = live.first(where: {
+        ($0.localizedName ?? "").lowercased() == lower
+            || ($0.bundleURL?.deletingPathExtension().lastPathComponent ?? "").lowercased() == lower
+    }) {
+        return describe(a)
+    }
+
+    // 确实未运行：尝试拉起
     if q.contains("/") {
         let url = URL(fileURLWithPath: q)
         let cfg = NSWorkspace.OpenConfiguration()
@@ -1564,18 +1577,68 @@ func syntheticallyActivate(pid: pid_t, timeout: TimeInterval = 0.5) -> Bool {
 /// 等目标应用有主窗口再动手。
 /// Codex 的 waitUntilHasPrimaryWindow(timeout:pollingInterval:)：冷启动或
 /// 窗口刚创建时 AX 树可能还没有窗口，此时点坐标会落到别处。
+func axHasWindow(_ app: AXUIElement) -> Bool {
+    if let w = attr(app, kAXMainWindowAttribute as String),
+       CFGetTypeID(w) == AXUIElementGetTypeID() {
+        return true
+    }
+    // 没有 AXMainWindow 的辅助应用，退一步看 AXWindows 是否非空
+    if let list = attr(app, kAXWindowsAttribute as String) as? [AXUIElement], !list.isEmpty {
+        return true
+    }
+    return false
+}
+
+/// 系统层是否已经有该进程的普通窗口（layer 0）。
+/// 用来区分「窗口还没建好」和「这应用就没有窗口」——
+/// 纯菜单栏应用永远没有，对它等满超时是白等。
+func cgHasWindow(pid: pid_t) -> Bool {
+    let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return false
+    }
+    for w in list {
+        guard (w[kCGWindowOwnerPID as String] as? pid_t) == pid else { continue }
+        guard (w[kCGWindowLayer as String] as? Int ?? -1) == 0 else { continue }
+        if let b = w[kCGWindowBounds as String] as? [String: Any],
+           let wd = b["Width"] as? Double, let ht = b["Height"] as? Double,
+           wd * ht > 100 {
+            return true
+        }
+    }
+    return false
+}
+
 func waitForPrimaryWindow(pid: pid_t, timeout: TimeInterval = 1.5) -> Bool {
     let app = AXUIElementCreateApplication(pid)
+    // 快速路径：AX 已经有窗口，不用等
+    if axHasWindow(app) { return true }
+
+    // AX 没有窗口时先看系统层。窗口正在创建的应用会在几百毫秒内出现，
+    // 纯菜单栏应用永远不会有——对后者不该等满 1.5 秒。
+    var knownWindow = cgHasWindow(pid: pid)
+    if !knownWindow {
+        // 只有刚启动的应用还可能在建窗口。跑了很久的应用没有窗口
+        // 就是真的没有（菜单栏应用、纯后台 helper），一秒都不该等。
+        // 拿不到启动时间的多半是系统进程（Spotlight、控制中心），同样不等
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            if let launched = app.launchDate {
+                if Date().timeIntervalSince(launched) > 3.0 { return false }
+            } else {
+                return false
+            }
+        }
+        let quickDeadline = Date().addingTimeInterval(0.3)
+        while Date() < quickDeadline {
+            if cgHasWindow(pid: pid) { knownWindow = true; break }
+            usleep(30_000)
+        }
+        if !knownWindow { return false }
+    }
+
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-        if let w = attr(app, kAXMainWindowAttribute as String),
-           CFGetTypeID(w) == AXUIElementGetTypeID() {
-            return true
-        }
-        // 没有 AXMainWindow 的辅助应用，退一步看 AXWindows 是否非空
-        if let list = attr(app, kAXWindowsAttribute as String) as? [AXUIElement], !list.isEmpty {
-            return true
-        }
+        if axHasWindow(app) { return true }
         usleep(50_000)
     }
     return false
