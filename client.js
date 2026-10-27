@@ -392,7 +392,12 @@ window.__ModuleLoader__.load({
     }
 
     /** 轮询 /status，只在有活跃目标时渲染小窗。 */
-    function LivePreview({ sessions }) {
+    // 会话服务在 apply 时赋值。slot 的 renderSlot 只传空 props，
+    // 用模块级引用拿会话，保持注册形状是裸组件（包装成箭头函数会让 slot 不渲染）。
+    let sessionsRef = null
+
+    function LivePreview() {
+      const sessions = sessionsRef
       const [status, setStatus] = React.useState(null)
       // 当前会话：只有本会话发起的操作才在这里出预览。
       // cua-mcp 经 MCP _meta 带上会话标识，cua-live 按它归属目标窗口。
@@ -749,13 +754,11 @@ window.__ModuleLoader__.load({
       })
       // 对话页右上角的实时画面。没有活跃目标时组件自己渲染 null，
       // 不占位、不显示空框。
-      // 会话服务在 apply 时已就绪（inject 声明过），闭包传给组件；
-      // slot 的 renderSlot 只传空 props，拿不到会话上下文。
-      const sessions = ctx.sessions
+      sessionsRef = ctx.sessions
       ctx.slots.inject('conversation.session.header.corner', () =>
         ctx.slots.register(
           { name: 'conversation.session.header.corner' },
-          () => h(LivePreview, { sessions }),
+          LivePreview,
         ),
       )
     }

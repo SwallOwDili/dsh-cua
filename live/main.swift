@@ -286,9 +286,11 @@ final class LiveState {
         sweepLocked()
         // 最近被操作的排前面：同时操作多个应用时，最上面应该是刚动过的那个
         var list = targets.values.sorted { $0.expiresAt > $1.expiresAt }
-        // 带 session 查询就只返回该会话的目标；空 session 的旧目标不认领
+        // 带 session 查询只返回该会话的目标。
+        // 但空 session 的目标（外部脚本直接调 cua-mcp，没有会话上下文）
+        // 无从归属，对谁都显示比谁都不显示有用。
         if let s = session, !s.isEmpty {
-            list = list.filter { $0.session == s }
+            list = list.filter { $0.session == s || $0.session.isEmpty }
         }
         return list.map { t in
             let f = frames[t.windowID]
