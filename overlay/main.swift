@@ -318,6 +318,10 @@ final class BadgeView: NSView {
 // MARK: - 覆盖窗口
 
 final class OverlayWindow: NSWindow {
+    /// 最后一次收到指令的时间，用于空闲自退
+    nonisolated(unsafe) static var lastActivity = Date()
+    static func noteActivity() { lastActivity = Date() }
+
     init() {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
@@ -524,6 +528,7 @@ final class CommandServer {
     private func acceptLoop() {
         while true {
             let fd = accept(listenFD, nil, nil)
+            OverlayWindow.noteActivity()
             if fd < 0 { continue }
 
             var buf = [UInt8](repeating: 0, count: 4096)
@@ -600,6 +605,18 @@ final class CommandServer {
 }
 
 // MARK: - 入口
+
+/// 空闲自退：浮层是被 mark 命令按需拉起的常驻进程，
+/// 没人再发指令就该退出。否则它会一直悬在某个窗口上面，
+/// 用户点那个应用时点击被浮层吃掉，表现为「应用打不开」。
+let idleTimeout: TimeInterval = 60
+DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+    Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+        if Date().timeIntervalSince(OverlayWindow.lastActivity) > idleTimeout {
+            exit(0)
+        }
+    }
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
