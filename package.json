@@ -1,0 +1,61 @@
+{
+  "name": "dsh-cua",
+  "version": "1.1.0",
+  "description": "macOS Computer Use for DeepSeek Harness — native AX tree, screenshot, and input injection as MCP tools",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "bin/cua-mcp",
+    "bin/cua-overlay",
+    "src/main.swift",
+    "overlay/main.swift",
+    "build.sh",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "computer-use",
+    "macos",
+    "accessibility",
+    "mcp"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SwallOwDili/dsh-cua.git"
+  },
+  "author": "SwallOwDili",
+  "homepage": "https://github.com/SwallOwDili/dsh-cua#readme",
+  "bugs": {
+    "url": "https://github.com/SwallOwDili/dsh-cua/issues"
+  },
+  "license": "MIT"
+}
