@@ -13,7 +13,9 @@
   "files": [
     "index.js",
     "client.js",
+    "mcp-bridge.js",
     "cordis.patch.yml",
+    "LICENSE",
     "bin/cua-mcp",
     "bin/cua-overlay",
     "bin/cua-live",
@@ -21,6 +23,7 @@
     "overlay/main.swift",
     "live/main.swift",
     "build.sh",
+    "pack-release.sh",
     "README.md"
   ],
   "keywords": [
@@ -61,9 +64,7 @@
   },
   "license": "MIT",
   "bin": {
-    "cua-mcp": "./bin/cua-mcp",
-    "cua-live": "./bin/cua-live",
-    "cua-overlay": "./bin/cua-overlay"
+    "cua-mcp": "./bin/cua-mcp"
   },
   "peerDependencies": {
     "@deepseek-ai/schemastery": "*",

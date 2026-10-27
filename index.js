@@ -63,6 +63,12 @@ export const RuntimeSettings = Schema.object({
   overlayEnabled: Schema.boolean()
     .default(true)
     .description('是否在屏幕上显示「AI 正在操作」标记与橙色虚拟光标。'),
+  livePreviewEnabled: Schema.boolean()
+    .default(true)
+    .description(
+      '是否在对话页右上角显示实时画面小窗。与屏幕标记独立：' +
+        '关掉标记仍可保留预览，反过来也一样。',
+    ),
   overlayTtlSeconds: Schema.number()
     .default(20)
     .description('标记与虚拟光标在没有新动作后保留的秒数。'),
@@ -200,12 +206,21 @@ export async function apply(ctx, config) {
     'select_text', 'paste', 'perform_secondary_action', 'open_app', 'drag',
   ])
   const approvedScopes = new Set()
-  const approval = ctx.get('approval')
+  // 不能在这里取一次快照。approval 服务若晚于插件就绪，
+  // 拿到 undefined 之后再也不重试，审批就等于永久失效。
+  const getApproval = () => {
+    try {
+      return ctx.get('approval')
+    } catch {
+      return undefined
+    }
+  }
 
   const askApproval = async (toolName, args, exec) => {
     const mode = currentConfig?.approvalMode ?? 'off'
     if (mode === 'off') return
     if (!WRITE_TOOLS.has(toolName)) return
+    const approval = getApproval()
     if (!approval || !exec?.agent) return
 
     const app = typeof args?.app === 'string' ? args.app : ''

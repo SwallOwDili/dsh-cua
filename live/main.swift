@@ -25,8 +25,10 @@ import UniformTypeIdentifiers
 
 let listenPort: UInt16 = 18901
 let frameInterval: TimeInterval = 1.0 / 3.0
-let previewWidth: Double = 480
-let jpegQuality: Double = 0.5
+// 预览卡显示宽度是 132 CSS px（见 client.js 的 CARD_W）。
+// 抓 2 倍做 retina 就够，480 是 3.6 倍过采样，四分之三的像素编码完就扔。
+let previewWidth: Double = 264
+let jpegQuality: Double = 0.55
 let boundary = "cualiveframe"
 
 // MARK: - 目标窗口
@@ -83,42 +85,88 @@ func encodeJPEG(_ image: CGImage, quality: Double) -> Data? {
     return data as Data
 }
 
-/// 抓一帧并缩到预览宽度。返回 nil 表示窗口消失或抓取失败。
-func capturePreview(windowID: CGWindowID) -> (data: Data, width: Int, height: Int)? {
-    let sem = DispatchSemaphore(value: 0)
-    var out: (Data, Int, Int)?
-    Task {
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                false, onScreenWindowsOnly: false
-            )
-            if let win = content.windows.first(where: { $0.windowID == windowID }) {
-                let filter = SCContentFilter(desktopIndependentWindow: win)
-                let cfg = SCStreamConfiguration()
-                let rect = filter.contentRect
-                let scale = max(1.0, Double(filter.pointPixelScale))
-                let fullW = max(1.0, rect.width * scale)
-                let fullH = max(1.0, rect.height * scale)
-                let factor = min(1.0, previewWidth / fullW)
-                cfg.width = max(1, Int(fullW * factor))
-                cfg.height = max(1, Int(fullH * factor))
-                cfg.showsCursor = false
-                cfg.capturesAudio = false
-                cfg.pixelFormat = kCVPixelFormatType_32BGRA
-                let img = try await SCScreenshotManager.captureImage(
-                    contentFilter: filter, configuration: cfg
-                )
-                if let enc = encodeJPEG(img, quality: jpegQuality) {
-                    out = (enc, img.width, img.height)
-                }
-            }
-        } catch {
-            out = nil
+/// SCShareableContent 是全局窗口枚举，单次几十到上百毫秒。
+/// 每次抓帧都重新枚举的话，多窗口并发出帧会把自己拖死。
+/// 缓存 2 秒：新窗口最晚 2 秒后可见，对 20 秒的目标 TTL 完全够。
+/// 读写都收在同步函数里——NSLock 在 async 上下文里持有会报
+/// “unavailable from asynchronous contexts”，等 await 跨过锁就是死锁。
+private let contentLock = NSLock()
+private var cachedContent: (content: SCShareableContent, at: Date)?
+private let contentTTL: TimeInterval = 2.0
+
+private func readCachedContent() -> SCShareableContent? {
+    contentLock.lock()
+    defer { contentLock.unlock() }
+    guard let c = cachedContent, Date().timeIntervalSince(c.at) < contentTTL else { return nil }
+    return c.content
+}
+
+private func storeContent(_ c: SCShareableContent) {
+    contentLock.lock()
+    cachedContent = (c, Date())
+    contentLock.unlock()
+}
+
+func shareableContent(force: Bool = false) async throws -> SCShareableContent {
+    if !force, let hit = readCachedContent() { return hit }
+    let fresh = try await SCShareableContent.excludingDesktopWindows(
+        false, onScreenWindowsOnly: false
+    )
+    storeContent(fresh)
+    return fresh
+}
+
+/// 抓一帧并缩到预览宽度。返回 nil 表示窗口消失、抓取失败或超时。
+///
+/// 全程 async，不占线程。上一版是同步函数里用信号量等异步结果，
+/// 每个窗口会占住一条 GCD 线程最多 5 秒，多窗口时线程池贴着上限跑。
+func capturePreview(
+    windowID: CGWindowID, timeout: TimeInterval = 6
+) async -> (data: Data, width: Int, height: Int)? {
+    await withTaskGroup(of: (data: Data, width: Int, height: Int)?.self) { group in
+        group.addTask { await captureOne(windowID: windowID) }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            return nil
         }
-        sem.signal()
+        // 谁先回来用谁。抓帧不响应取消，超时那条会自己在后台跑完并丢弃。
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
     }
-    _ = sem.wait(timeout: .now() + 5)
-    return out
+}
+
+private func captureOne(windowID: CGWindowID) async -> (data: Data, width: Int, height: Int)? {
+    do {
+        var content = try await shareableContent()
+        var win = content.windows.first(where: { $0.windowID == windowID })
+        if win == nil {
+            // 缓存里没有不代表窗口不存在。缓存 TTL 2 秒，
+            // 新目标会在出首帧之前就被判成失效——找不到就强制刷新再判。
+            content = try await shareableContent(force: true)
+            win = content.windows.first(where: { $0.windowID == windowID })
+        }
+        guard let win else { return nil }
+        let filter = SCContentFilter(desktopIndependentWindow: win)
+        let cfg = SCStreamConfiguration()
+        let rect = filter.contentRect
+        let scale = max(1.0, Double(filter.pointPixelScale))
+        let fullW = max(1.0, rect.width * scale)
+        let fullH = max(1.0, rect.height * scale)
+        let factor = min(1.0, previewWidth / fullW)
+        cfg.width = max(1, Int(fullW * factor))
+        cfg.height = max(1, Int(fullH * factor))
+        cfg.showsCursor = false
+        cfg.capturesAudio = false
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        let img = try await SCScreenshotManager.captureImage(
+            contentFilter: filter, configuration: cfg
+        )
+        guard let enc = encodeJPEG(img, quality: jpegQuality) else { return nil }
+        return (enc, img.width, img.height)
+    } catch {
+        return nil
+    }
 }
 
 // MARK: - 状态与广播
@@ -128,19 +176,26 @@ final class LiveState {
     /// 同时被操作的多个窗口各存一份。键是 CGWindowID。
     private var targets: [CGWindowID: Target] = [:]
     private var frames: [CGWindowID: Frame] = [:]
-    private var capturing = false
-    private let missLimit = 5
+    /// 正在抓的窗口。避免上一帧还没回来就又排一次，SCK 慢的时候会堆积。
+    private var inFlight: Set<CGWindowID> = []
+    /// 连续抓取失败次数。不能拿 frames 是否存在来计数：
+    /// 清掉帧之后 frames 本来就不存在，计数永远起不来，
+    /// 那个窗口会一直排在轮转队首，其他窗口全部停更直到 TTL 过期。
+    private var missCounts: [CGWindowID: Int] = [:]
+    /// 连续抓取失败的次数上限。1/3 秒一次，10 次约 3.3 秒——
+    /// 太短的窗口（比如 5 次 = 1.7 秒）会把 SCK 偶发抽风的活窗口摘掉。
+    private let missLimit = 10
 
     struct Frame {
         var jpeg: Data
         var seq: Int
         var width: Int
         var height: Int
-        var missStreak: Int
     }
 
     /// 客户端订阅：一条连接只收它指定的窗口（nil 表示收任意窗口）。
-    private var clients: [(conn: NWConnection, window: CGWindowID?)] = []
+    /// lastSend 用来兜底清理收不到 FIN 的死连接。
+    private var clients: [(conn: NWConnection, window: CGWindowID?, lastSend: Date)] = []
 
     func setTarget(pid: pid_t, appName: String, ttl: Double, explicit: CGWindowID?, session: String = "") {
         guard let wid = explicit ?? windowID(for: pid) else { return }
@@ -163,6 +218,8 @@ final class LiveState {
         lock.lock()
         targets.removeAll()
         frames.removeAll()
+        missCounts.removeAll()
+        inFlight.removeAll()
         let victims = clients.map { $0.conn }
         clients.removeAll()
         lock.unlock()
@@ -175,6 +232,7 @@ final class LiveState {
         for (wid, t) in targets where now >= t.expiresAt {
             targets.removeValue(forKey: wid)
             frames.removeValue(forKey: wid)
+            missCounts.removeValue(forKey: wid)
         }
     }
 
@@ -194,35 +252,43 @@ final class LiveState {
         return targets.values.max { $0.expiresAt < $1.expiresAt }
     }
 
-    /// 挑一个还没在抓的窗口交出去。调用方抓完调 endCapture。
-    func beginCapture() -> Target? {
+    /// 一次 tick 里所有该抓的窗口。调用方抓完调 endCapture(window:)。
+    /// 上一版是「一次只放一个窗口出去」，N 个窗口时每个窗口 1/(3N) 帧/秒：
+    /// 五个窗口就掉到 1.7 秒一帧，画面看着是卡的。
+    /// 现在每帧窗各自并发，只有一个窗口时也不比原来慢。
+    func beginCaptureAll() -> [Target] {
         lock.lock()
         defer { lock.unlock() }
         sweepLocked()
-        if capturing { return nil }
-        // 轮转：优先抓没有帧或帧最旧的窗口
-        guard let next = targets.values.min(by: {
-            (frames[$0.windowID]?.seq ?? -1) < (frames[$1.windowID]?.seq ?? -1)
-        }) else { return nil }
-        capturing = true
-        return next
+        var batch: [Target] = []
+        for t in targets.values where !inFlight.contains(t.windowID) {
+            inFlight.insert(t.windowID)
+            batch.append(t)
+        }
+        return batch
     }
 
-    func endCapture() {
+    func endCapture(window: CGWindowID) {
         lock.lock()
-        capturing = false
+        inFlight.remove(window)
         lock.unlock()
     }
 
     func noteMiss(window: CGWindowID) {
         lock.lock()
         defer { lock.unlock() }
-        guard var f = frames[window] else { return }
-        f.missStreak += 1
-        if f.missStreak >= missLimit {
+        let n = (missCounts[window] ?? 0) + 1
+        if n >= missLimit {
+            // 连续抓不到说明窗口没了。直接摘出目标，
+            // 否则它会一直占着轮转名额，其他窗口冻到 TTL 过期为止。
+            targets.removeValue(forKey: window)
             frames.removeValue(forKey: window)
+            missCounts.removeValue(forKey: window)
+            FileHandle.standardError.write(
+                Data("[cua-live] 移除失效目标 win=\(window)（连续 \(n) 次抓取失败）\n".utf8)
+            )
         } else {
-            frames[window] = f
+            missCounts[window] = n
         }
     }
 
@@ -233,22 +299,42 @@ final class LiveState {
             return
         }
         let seq = (frames[target.windowID]?.seq ?? 0) + 1
-        frames[target.windowID] = Frame(jpeg: jpeg, seq: seq, width: width, height: height, missStreak: 0)
-        let recipients = clients.filter { $0.window == nil || $0.window == target.windowID }
+        frames[target.windowID] = Frame(jpeg: jpeg, seq: seq, width: width, height: height)
+        missCounts[target.windowID] = 0
+        let now = Date()
+        for i in clients.indices where clients[i].window == nil || clients[i].window == target.windowID {
+            clients[i].lastSend = now
+        }
+        let recipients = clients
+            .filter { $0.window == nil || $0.window == target.windowID }
+            .map { $0.conn }
         lock.unlock()
 
         guard !recipients.isEmpty else { return }
         var chunk = Data("--\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(jpeg.count)\r\n\r\n".utf8)
         chunk.append(jpeg)
         chunk.append(Data("\r\n".utf8))
-        for c in recipients { c.conn.send(content: chunk, completion: .contentProcessed { _ in }) }
+        for conn in recipients {
+            // 发送失败说明对端已经走了，立刻摘掉，别等状态回调——
+            // 长连接上有时等不到 .cancelled，viewers 就会虚高不降。
+            conn.send(content: chunk, completion: .contentProcessed { err in
+                if err != nil { self.removeClient(conn) }
+            })
+        }
     }
 
     func addClient(_ conn: NWConnection, window: CGWindowID?) {
         lock.lock()
-        clients.append((conn, window))
-        let seed = window.flatMap { frames[$0]?.jpeg }
-            ?? frames.values.max { $0.seq < $1.seq }?.jpeg
+        clients.append((conn, window, Date()))
+        // 指定了窗口就只能给这个窗口的帧。之前这里对两种情况都用了
+        // 「退到最新的一帧」，结果是订阅 A 的连接在首帧到达前会先收到
+        // B 的一帧画面——跨会话直接串画面。
+        let seed: Data?
+        if let w = window {
+            seed = frames[w]?.jpeg
+        } else {
+            seed = frames.values.max { $0.seq < $1.seq }?.jpeg
+        }
         lock.unlock()
         if let frame = seed {
             var chunk = Data("--\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(frame.count)\r\n\r\n".utf8)
@@ -262,6 +348,34 @@ final class LiveState {
         lock.lock()
         clients.removeAll { $0.conn === conn }
         lock.unlock()
+    }
+
+    /// 清掉已经没人需要的订阅连接：订阅的窗口早就不在目标里了，
+    /// 或者长时间一帧都没发出去（对端悄悄断了但没给 FIN）。
+    /// 返回的连接由调用方在锁外 cancel。
+    func sweepDeadClients(idle: TimeInterval = 600) -> [NWConnection] {
+        lock.lock()
+        let now = Date()
+        var dead: [NWConnection] = []
+        var keep: [(conn: NWConnection, window: CGWindowID?, lastSend: Date)] = []
+        for c in clients {
+            let orphan = c.window.map { targets[$0] == nil } ?? false
+            let stale = now.timeIntervalSince(c.lastSend) > idle
+            if orphan || stale {
+                dead.append(c.conn)
+            } else {
+                keep.append(c)
+            }
+        }
+        let dropped = clients.count - keep.count
+        clients = keep
+        lock.unlock()
+        if dropped > 0 {
+            FileHandle.standardError.write(
+                Data("[cua-live] 清理 \(dropped) 条失效订阅连接\n".utf8)
+            )
+        }
+        return dead
     }
 
     func clientCount() -> Int {
@@ -318,6 +432,69 @@ let workQueue = DispatchQueue(label: "cua.live.server")
 // 启动时在主线程摸一次 CGMainDisplayID，把连接建起来。
 _ = CGMainDisplayID()
 
+// MARK: - 自检
+//
+// 这层的坑（死窗口占住抓帧名额、并发被串行化、端口被旧实例占着）
+// 都看不见也报不出来，只能靠外部 curl 猜。做成自检才能回归。
+
+func portIsFree(_ port: UInt16, host: String = "127.0.0.1") -> Bool {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    var yes: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+    var addr = sockaddr_in()
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = port.bigEndian
+    addr.sin_addr = in_addr(s_addr: inet_addr(host))
+    let bound = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    return bound == 0
+}
+
+func runSelfTest() -> Int32 {
+    var failed = 0
+    func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+        print("\(ok ? "ok  " : "FAIL") \(name)\(detail.isEmpty ? "" : " — \(detail)")")
+        if !ok { failed += 1 }
+    }
+
+    check("screen capture preflight", CGPreflightScreenCaptureAccess())
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    check("window enumeration", !windows.isEmpty, "\(windows.count) 个可见窗口")
+
+    // 调度器：两个目标必须一起进批次，否则多窗口时互相排队
+    let probe = LiveState()
+    probe.setTarget(pid: getpid(), appName: "selftest-a", ttl: 60, explicit: 900001)
+    probe.setTarget(pid: getpid(), appName: "selftest-b", ttl: 60, explicit: 900002)
+    let batch = probe.beginCaptureAll()
+    check("并发调度", batch.count == 2, "批次 \(batch.count) 个")
+    check("同窗口不重入", probe.beginCaptureAll().isEmpty)
+    for t in batch { probe.endCapture(window: t.windowID) }
+    check("抓完可再排", probe.beginCaptureAll().count == 2)
+
+    // 连续抓不到的目标必须被摘掉，否则会永久占着名额把别的窗口饿死
+    probe.clear()
+    probe.setTarget(pid: getpid(), appName: "ghost", ttl: 60, explicit: 900003)
+    for _ in 0..<10 { probe.noteMiss(window: 900003) }
+    check("失效目标摘除", probe.snapshot(session: nil).isEmpty)
+
+    // 端口只报告不判失败：已有实例在跑时被占用是正常的
+    print("info 端口 \(listenPort) \(portIsFree(listenPort) ? "空闲" : "已被占用（可能已有实例在跑）")")
+
+    print(failed == 0 ? "SELFTEST PASS" : "SELFTEST FAIL (\(failed) 项)")
+    return failed == 0 ? 0 : 1
+}
+
+if CommandLine.arguments.contains("--selftest") {
+    exit(runSelfTest())
+}
+
 
 // MARK: - 聚焦目标窗口
 //
@@ -351,9 +528,15 @@ func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
 enum RequestLog {
     static let path = "/tmp/cua-live-requests.log"
     static let lock = NSLock()
+    static let maxBytes = 512 * 1024
     static func note(_ p: String) {
         lock.lock(); defer { lock.unlock() }
         let line = "\(Date().timeIntervalSince1970) \(p)\n"
+        // /status 每 1.5 秒一条，不封顶会一直写下去。到 512KB 就整个重开。
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let size = attrs[.size] as? Int, size > maxBytes {
+            try? FileManager.default.removeItem(atPath: path)
+        }
         if let h = FileHandle(forWritingAtPath: path) {
             h.seekToEndOfFile()
             h.write(line.data(using: .utf8)!)
@@ -479,6 +662,20 @@ func handleConnection(_ conn: NWConnection) {
                     break
                 }
             }
+            // 必须持续读。这是无限响应，浏览器关掉页面时发的是 FIN，
+            // 不读就永远收不到 .cancelled，viewers 只涨不降（实测漏到 6）。
+            // 读到的数据本身没用，丢弃，只看连接是否还在。
+            func drain() {
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { _, _, isComplete, error in
+                    if error != nil || isComplete {
+                        state.removeClient(conn)
+                        conn.cancel()
+                        return
+                    }
+                    drain()
+                }
+            }
+            drain()
 
         default:
             conn.send(content: httpResponse(
@@ -495,12 +692,21 @@ let pumpQueue = DispatchQueue(label: "cua.live.pump")
 let pumpTimer = DispatchSource.makeTimerSource(queue: pumpQueue)
 pumpTimer.schedule(deadline: .now() + 0.1, repeating: frameInterval)
 pumpTimer.setEventHandler {
-    guard let target = state.beginCapture() else { return }
-    defer { state.endCapture() }
-    if let frame = capturePreview(windowID: target.windowID) {
-        state.publish(frame.data, target: target, width: frame.width, height: frame.height)
-    } else {
-        state.noteMiss(window: target.windowID)
+    // 顺手清掉失效订阅，viewers 才不会是虚数
+    for dead in state.sweepDeadClients() { dead.cancel() }
+    // 每个窗口各自跑，互不排队。抓帧是 async 的，直接在 Task 里等，
+    // 不占线程，也不会像上一版那样把 pump 队列串起来。
+    let batch = state.beginCaptureAll()
+    guard !batch.isEmpty else { return }
+    for target in batch {
+        Task {
+            defer { state.endCapture(window: target.windowID) }
+            if let frame = await capturePreview(windowID: target.windowID) {
+                state.publish(frame.data, target: target, width: frame.width, height: frame.height)
+            } else {
+                state.noteMiss(window: target.windowID)
+            }
+        }
     }
 }
 pumpTimer.resume()

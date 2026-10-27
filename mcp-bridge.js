@@ -23,6 +23,7 @@ export class McpBridge extends EventEmitter {
   #nextId = 1
   #pending = new Map()
   #closed = false
+  #starting = null
 
   constructor(binary, options = {}) {
     super()
@@ -44,6 +45,16 @@ export class McpBridge extends EventEmitter {
     this.#child.stdout.setEncoding('utf8')
     this.#child.stdout.on('data', (chunk) => this.#onData(chunk))
 
+    // 子进程退出后再往 stdin 写会 EPIPE。没人接住这个 error 事件，
+    // Node 会把它升级成未捕获异常，直接带走宿主进程。
+    this.#child.stdin.on('error', (error) => {
+      this.#closed = true
+      // 同样要清引用，否则下一次 ensureReady 会因为 start() 里的
+      // “已存在 child”提前返回，再也不重新拉起。
+      this.#child = undefined
+      this.emit('error', error)
+    })
+
     this.#child.stderr.setEncoding('utf8')
     this.#child.stderr.on('data', (chunk) => {
       this.emit('stderr', chunk)
@@ -51,6 +62,10 @@ export class McpBridge extends EventEmitter {
 
     this.#child.on('exit', (code, signal) => {
       this.#closed = true
+      // 必须清掉引用。否则 ensureReady 里 start() 会因为
+      // “已经有一个 child”直接返回，永远不重新 spawn，
+      // 而每次调用都会挂到 180 秒超时——全部工具瘫痪到宿主重启。
+      this.#child = undefined
       const error = new Error(
         `cua-mcp 退出 (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
       )
@@ -61,6 +76,7 @@ export class McpBridge extends EventEmitter {
 
     this.#child.on('error', (error) => {
       this.#closed = true
+      this.#child = undefined
       this.emit('error', error)
     })
   }
@@ -106,6 +122,14 @@ export class McpBridge extends EventEmitter {
 
   #send(payload) {
     if (!this.isRunning) throw new Error('cua-mcp 未运行')
+    // 管道已死时 write 不会同步抛，只会异步给个 EPIPE——请求就会一直
+    // 挂到 180 秒超时。这里同步判死，让调用方立刻拿到错误，
+    // 下一次调用再由 ensureReady 重新拉起。
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      this.#closed = true
+      this.#child = undefined
+      throw new Error('cua-mcp 已退出')
+    }
     this.#child.stdin.write(JSON.stringify(payload) + '\n')
   }
 
@@ -133,10 +157,25 @@ export class McpBridge extends EventEmitter {
    */
   async ensureReady() {
     if (this.isRunning) return
-    this.#closed = false
-    this.#buffer = ''
-    this.start()
-    await this.initialize()
+    // 并发调用只允许一个 initialize。MCP 规定握手一次，
+    // 两个会话同时发起工具调用时重复握手会让子进程状态错乱。
+    if (!this.#starting) {
+      this.#starting = (async () => {
+        this.#closed = false
+        this.#buffer = ''
+        this.start()
+        await this.initialize()
+      })()
+    }
+    try {
+      await this.#starting
+    } catch (error) {
+      // 握手失败就别留着半死的子进程
+      this.stop()
+      throw error
+    } finally {
+      this.#starting = null
+    }
   }
 
   async initialize() {

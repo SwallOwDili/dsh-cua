@@ -383,6 +383,7 @@ struct RuntimeConfig: Decodable {
     var browserCdpPort: Int = 0
     var browserCdpHost: String = "127.0.0.1"
     var overlayEnabled: Bool = true
+    var livePreviewEnabled: Bool = true
     var overlayTtlSeconds: Double = 20
     var backgroundSilence: Bool = true
     var scrollStepPx: Int = 40
@@ -396,7 +397,7 @@ struct RuntimeConfig: Decodable {
     // 而配置文件允许只写部分键，所以逐字段 decodeIfPresent。
     // 手写 init(from:) 后编译器不再合成 CodingKeys，必须显式声明。
     enum CodingKeys: String, CodingKey {
-        case browserCdpPort, browserCdpHost, overlayEnabled, overlayTtlSeconds
+        case browserCdpPort, browserCdpHost, overlayEnabled, livePreviewEnabled, overlayTtlSeconds
         case backgroundSilence, scrollStepPx, maxElements
         case syntheticActivate, historyEnabled, deniedBundleIDs, allowedBundleIDs
     }
@@ -408,6 +409,7 @@ struct RuntimeConfig: Decodable {
         browserCdpPort = (try? c.decodeIfPresent(Int.self, forKey: .browserCdpPort)) .flatMap { $0 } ?? 0
         browserCdpHost = (try? c.decodeIfPresent(String.self, forKey: .browserCdpHost)).flatMap { $0 } ?? "127.0.0.1"
         overlayEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .overlayEnabled)).flatMap { $0 } ?? true
+        livePreviewEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .livePreviewEnabled)).flatMap { $0 } ?? true
         overlayTtlSeconds = (try? c.decodeIfPresent(Double.self, forKey: .overlayTtlSeconds)).flatMap { $0 } ?? 20
         backgroundSilence = (try? c.decodeIfPresent(Bool.self, forKey: .backgroundSilence)).flatMap { $0 } ?? true
         scrollStepPx = (try? c.decodeIfPresent(Int.self, forKey: .scrollStepPx)).flatMap { $0 } ?? 40
@@ -1231,7 +1233,8 @@ var currentSessionID: String = ""
 
 enum Live {
     static let port = 18901
-    static var launched = false
+    /// 上次 spawn 的时间，只用来防连击
+    static var lastSpawnAt: Date = .distantPast
     /// 抓帧是 3fps 的常驻开销，目标没变就不必重复通知
     static var lastKey = ""
     static var lastSentAt: Date = .distantPast
@@ -1263,8 +1266,11 @@ enum Live {
 
     static func ensureRunning() {
         if isServing() { return }
-        if launched { return }
-        launched = true
+        // 这里原来有个 launched 短路：cua-live 一旦退出（崩溃、被杀、系统回收），
+        // 标志还是 true，于是永远不再拉起，预览从此消失到 dsh 重启为止。
+        // 改成只按时间防连击，存活与否每次实际探测。
+        if Date().timeIntervalSince(lastSpawnAt) < 1.0 { return }
+        lastSpawnAt = Date()
         guard FileManager.default.isExecutableFile(atPath: binaryPath) else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: binaryPath)
@@ -1308,7 +1314,8 @@ enum Live {
 
 enum Overlay {
     static let socketPath = "/tmp/cua-overlay.sock"
-    static var launched = false
+    /// 上次 spawn 的时间，只用来防连击
+    static var lastSpawnAt: Date = .distantPast
     static var lastPID: pid_t = 0
     static var lastWindow: CGWindowID = 0
     static var lastSentAt: Date = .distantPast
@@ -1320,8 +1327,10 @@ enum Overlay {
     }
 
     static func ensureRunning() {
-        if launched { return }
-        launched = true
+        // 原本这里是 launched 一置位就永不再探测。overlay 有 60 秒空闲自退出，
+        // 标志却还留在 true，于是第一次操作之后角标再也不会出现——
+        // 「有时候在操作不出现 AI 标记」的真凶就是这个。
+        // 改成每次实际探测：isAlive 是一次 unix socket connect，微秒级。
 
         // 已有 overlay 在跑就直接复用，但必须先核对版本。
         // Mach-O 一旦加载就固定在内存里：二进制更新后老进程会继续跑旧代码，
@@ -1336,8 +1345,12 @@ enum Overlay {
                 usleep(200_000)
             }
             unlink(socketPath)
+        } else if Date().timeIntervalSince(lastSpawnAt) < 1.0 {
+            // 刚拉起还在等它就绪，别连击
+            return
         }
 
+        lastSpawnAt = Date()
         guard FileManager.default.isExecutableFile(atPath: binaryPath) else { return }
         // 陈旧 socket 文件会让 connect 立即失败，先清掉
         unlink(socketPath)
@@ -1449,12 +1462,11 @@ enum Overlay {
 
     /// 标记某个 app 的窗口正在被操作；空闲 20s 后自动隐藏。
     static func mark(pid: pid_t, appName: String, windowID explicitWindow: CGWindowID? = nil) {
-        guard CuaConfig.current().overlayEnabled else { return }
+        guard let wid = explicitWindow ?? windowID(for: pid) else { return }
         // overlay 指令是 socket 往返 + 一次 CGWindowList 全量遍历，
         // 单次约 5-15ms。同一个 app 连续操作时没必要重发。
         // 只在切换目标或距上次发送超过 2s 时才刷新（保证 ttl 续期）。
         let now = Date()
-        guard let wid = explicitWindow ?? windowID(for: pid) else { return }
         // 窗口号也参与节流判断：同一 app 换了窗口就得重新标记，
         // 否则小窗会一直停在上一个窗口上。
         if lastPID == pid, lastWindow == wid, now.timeIntervalSince(lastSentAt) < 2.0 { return }
@@ -1462,9 +1474,18 @@ enum Overlay {
         lastPID = pid
         lastSentAt = now
 
+        let cfg = CuaConfig.current()
+        let ttl = cfg.overlayTtlSeconds
+        // 实时画面与屏幕角标是两个独立功能，各有关闭开关。
+        // 这条 notify 必须在 overlayEnabled 的判断之外——否则关掉角标
+        // 会把对话页的预览一起关掉，表现就是「预览时有时无」，整段消失。
+        if cfg.livePreviewEnabled {
+            Live.notify(pid: pid, appName: appName, ttl: ttl, windowID: wid)
+        }
+
+        guard cfg.overlayEnabled else { return }
         // ttl 交给 overlay 自己计时。cua-mcp 是一次性进程，
         // 用本进程的 asyncAfter 收尾在进程退出后会失效，标记会永久残留。
-        let ttl = CuaConfig.current().overlayTtlSeconds
         send([
             "cmd": "show",
             "windowID": Int(wid),
@@ -1472,8 +1493,6 @@ enum Overlay {
             "label": "AI 正在操作 \(appName)",
             "ttl": ttl,
         ])
-        // 同步把目标交给实时画面服务，对话页角标小窗据此出图
-        Live.notify(pid: pid, appName: appName, ttl: ttl, windowID: wid)
     }
 
     static func hide() {
@@ -2937,6 +2956,7 @@ func selfTest() -> Int32 {
     print("config readable:", FileManager.default.isReadableFile(atPath: CuaConfig.path))
     print("config policy: denied=\(cfg.deniedBundleIDs.count) allowed=\(cfg.allowedBundleIDs.count)")
     print("config cdpPort:", cfg.browserCdpPort, "overlay:", cfg.overlayEnabled,
+          "live:", cfg.livePreviewEnabled,
           "ttl:", cfg.overlayTtlSeconds, "cap:", cfg.maxElements)
     print(ok ? "SELFTEST PASS" : "SELFTEST FAIL")
     return ok ? 0 : 1

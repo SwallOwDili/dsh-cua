@@ -43,6 +43,12 @@ window.__ModuleLoader__.load({
         hint: '关闭后 AI 操作不再在窗口左上角显示胶囊标记和橙色光标。',
       },
       {
+        field: 'livePreviewEnabled',
+        kind: 'boolean',
+        label: '对话页实时画面',
+        hint: '右上角的小窗。与屏幕标记互不影响，可单独关闭。',
+      },
+      {
         field: 'overlayTtlSeconds',
         kind: 'number',
         label: '标记保留秒数',
@@ -330,14 +336,45 @@ window.__ModuleLoader__.load({
     // 所以这里不需要任何票据；status 轮询只用来决定显示还是隐藏。
 
     const LIVE_BASE = 'http://127.0.0.1:18901'
+    /** 预览卡宽度（CSS px）。抓帧宽度是它的两倍，见 live/main.swift 的 previewWidth。 */
+    const CARD_W = 132
 
     const liveCss = {
-      // 多个目标纵向排列，每个小窗独立
+      // 一条主窗，背后错位露出几张的边
       stack: {
         display: 'flex',
-        flexDirection: 'column',
-        gap: '6px',
-        alignItems: 'flex-end',
+        alignItems: 'center',
+      },
+      // 叠放容器：按最大尺寸留位，背景卡绝对定位错位叠在主窗下面
+      deck: {
+        position: 'relative',
+        paddingRight: '6px',
+        paddingBottom: '6px',
+        // 主窗是 inline-flex，作为 inline 级元素会留下基线下沿的几像素空隙，
+        // 让主窗相对背后的卡看起来偏上。压掉行高就对齐了。
+        lineHeight: '0',
+      },
+      backCard: {
+        position: 'absolute',
+        top: 0,
+        left: 0,
+        borderRadius: '8px',
+        border: '0.5px solid var(--dsw-alias-border-l4, #dcdcdc)',
+        background: 'var(--dsw-alias-bg-layer-2, #fff)',
+        boxShadow: '0 1px 4px rgba(0,0,0,0.10)',
+      },
+      switcher: {
+        position: 'absolute',
+        right: '6px',
+        top: '6px',
+        padding: '1px 5px',
+        borderRadius: '4px',
+        background: 'rgba(0,0,0,0.55)',
+        color: '#fff',
+        fontSize: '10px',
+        lineHeight: '1.5',
+        cursor: 'pointer',
+        userSelect: 'none',
       },
       wrap: {
         position: 'relative',
@@ -346,7 +383,7 @@ window.__ModuleLoader__.load({
         cursor: 'pointer',
       },
       frame: {
-        width: '184px',
+        width: CARD_W + 'px',
         borderRadius: '8px',
         border: '0.5px solid var(--dsw-alias-border-l4, #dcdcdc)',
         background: 'var(--dsw-alias-bg-layer-2, #fff)',
@@ -363,7 +400,7 @@ window.__ModuleLoader__.load({
         color: '#fff',
         fontSize: '10px',
         lineHeight: '1.5',
-        maxWidth: '150px',
+        maxWidth: CARD_W - 24 + 'px',
         overflow: 'hidden',
         textOverflow: 'ellipsis',
         whiteSpace: 'nowrap',
@@ -371,8 +408,7 @@ window.__ModuleLoader__.load({
       checker: {
         borderRadius: '8px',
         border: '0.5px solid var(--dsw-alias-border-l4, #dcdcdc)',
-        backgroundImage: 'repeating-conic-gradient(#ececec 0% 25%, #fafafa 0% 50%)',
-        backgroundSize: '12px 12px',
+        background: 'var(--dsw-alias-bg-layer-2, #f7f7f7)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -395,9 +431,14 @@ window.__ModuleLoader__.load({
     // 会话服务在 apply 时赋值。slot 的 renderSlot 只传空 props，
     // 用模块级引用拿会话，保持注册形状是裸组件（包装成箭头函数会让 slot 不渲染）。
     let sessionsRef = null
+    let warnedNoSession = false
 
     function LivePreview() {
       const [status, setStatus] = React.useState(null)
+      // 记住"要看的那个窗口号"，不是下标。
+      // 服务端按最近操作时间排序，顺序随时会变；用下标的话，
+      // 你刚点开第 2 个，1.5 秒后排序一变，画面就自己跳到别人身上。
+      const [selectedWindow, setSelectedWindow] = React.useState(0)
       // 当前会话：只有本会话发起的操作才在这里出预览。
       // cua-mcp 经 MCP _meta 带上会话标识，cua-live 按它归属目标窗口。
       // 会话标识只用于过滤，拿不到就退化成「显示全部」。
@@ -431,6 +472,15 @@ window.__ModuleLoader__.load({
         let alive = true
         // 换会话先清空：新会话还没查完之前不要继续显示上一个会话的画面
         setStatus(null)
+        // 没有会话标识就连查都不查。服务端在没有 session 时不过滤，
+        // 会把所有会话的目标一起返回——请求都不发，才不会拿到别人的画面。
+        if (!sessionId) {
+          if (!warnedNoSession) {
+            warnedNoSession = true
+            console.warn('[dsh-cua] 拿不到当前会话标识，预览已停用')
+          }
+          return undefined
+        }
         const poll = async () => {
           try {
             const query = sessionId ? '?session=' + encodeURIComponent(sessionId) : ''
@@ -450,19 +500,30 @@ window.__ModuleLoader__.load({
       }, [sessionId])
 
       if (!status) return null
+      // 拿不到会话标识就什么都不显示。服务端在没带 session 时不过滤，
+      // 会把所有会话（包括别的脚本）的目标一起返回——那正好是要避免的串扰。
+      // 这里空着，好过把别人的窗口画到你界面上。
+      if (!sessionId) return null
 
-      // 多目标：同时被操作的每个窗口各出一个小窗，
-      // 从上到下排列，不合并、不互相覆盖。
-      const targets = Array.isArray(status.targets) ? status.targets : []
+      // 多目标按 Codex 的做法叠放：只显示一个主窗，其余错位露出一角，
+      // 点序号切换要看哪个。不并排——并排会把标题栏撑得很宽很乱。
+      // 还没抓到第一帧的目标也要留着：从发起到出帧有延迟，
+      // 把它滤掉会让整个预览凭空消失一段时间。
+      const targets = (Array.isArray(status.targets) ? status.targets : []).slice(0, 5)
       if (targets.length === 0) return null
 
-      const boxW = 184
+      // 选中的窗口没了（被关掉或过期）就退回列表第一个
+      let index = targets.findIndex((t) => t.window === selectedWindow)
+      if (index < 0) index = 0
+      const active = targets[index]
+
+      const boxW = CARD_W
 
       const frameFor = (t) => {
         const fw = t.width > 0 ? t.width : 0
         const fh = t.height > 0 ? t.height : 0
         const ratio = fw > 0 && fh > 0 ? fh / fw : 0.62
-        const boxH = Math.max(56, Math.min(220, Math.round(boxW * ratio)))
+        const boxH = Math.max(48, Math.min(88, Math.round(boxW * ratio)))
         return { width: boxW + 'px', height: boxH + 'px' }
       }
 
@@ -470,49 +531,87 @@ window.__ModuleLoader__.load({
         fetch(LIVE_BASE + '/focus?window=' + t.window, { cache: 'no-store' }).catch(() => {})
       }
 
+      const box = frameFor(active)
+      // 后面的窗口只画边框，错位 3px 叠在主窗之下，露出边就够暗示"还有"
+      const layered = targets.slice(index + 1).concat(targets.slice(0, index))
+
       return React.createElement(
         'div',
         { style: liveCss.stack },
-        targets.map((t) => {
-          const box = frameFor(t)
-          const body = t.alive
-            ? React.createElement('img', {
-                // win 参与查询串：同一窗口重新出现时强制重连
-                src: LIVE_BASE + '/live.mjpg?win=' + t.window + '&t=' + t.seq,
-                style: Object.assign({}, liveCss.frame, box, { objectFit: 'fill' }),
-                alt: '实时操作画面',
-              })
-            : React.createElement(
-                'div',
-                {
-                  style: Object.assign({}, liveCss.checker, box),
-                  title: '目标窗口当前不可见',
-                },
-                '画面暂不可用',
-              )
-
-          return React.createElement(
+        React.createElement(
+          'div',
+          { style: liveCss.deck },
+          layered.slice(0, 2).reverse().map((t, i) => {
+            const depth = layered.slice(0, 2).length - i
+            return React.createElement('div', {
+              key: 'back-' + t.window,
+              style: Object.assign({}, liveCss.backCard, box, {
+                transform: 'translate(' + depth * 3 + 'px, ' + depth * 3 + 'px)',
+                zIndex: depth,
+              }),
+            })
+          }),
+          React.createElement(
             'div',
             {
-              key: String(t.window),
-              style: liveCss.wrap,
+              key: String(active.window),
+              style: Object.assign({}, liveCss.wrap, { zIndex: 10 }),
               title: '点击跳到这个窗口',
-              onClick: () => focusTarget(t),
+              onClick: () => focusTarget(active),
               role: 'button',
               tabIndex: 0,
               onKeyDown: (e) => {
-                if (e.key === 'Enter' || e.key === ' ') focusTarget(t)
+                if (e.key === 'Enter' || e.key === ' ') focusTarget(active)
               },
             },
-            body,
+            active.alive
+              ? React.createElement('img', {
+                  // 不能带 seq 做 cache buster：每次轮询 seq 都变，
+                  // <img> 就会每秒重连一次 MJPEG，永远停在首帧之前。
+                  src: LIVE_BASE + '/live.mjpg?win=' + active.window,
+                  // contain 而不是 fill：高度有上限，4:3 的窗口按 fill 会把画面
+                  // 纵向压掉一成多，看着像糊了。宁可左右留一点白。
+                  style: Object.assign({}, liveCss.frame, box, { objectFit: 'contain' }),
+                  alt: '实时操作画面',
+                })
+              : React.createElement(
+                  'div',
+                  { style: Object.assign({}, liveCss.checker, box) },
+                  '连接中',
+                ),
             React.createElement(
               'span',
               { style: liveCss.tag },
               React.createElement('span', { style: liveCss.dot }),
-              t.app || '未知应用',
+              active.app || '未知应用',
             ),
-          )
-        }),
+            targets.length > 1
+              ? React.createElement(
+                  'span',
+                  {
+                    style: liveCss.switcher,
+                    title: '切换到下一个窗口',
+                    role: 'button',
+                    tabIndex: 0,
+                    onKeyDown: (e) => {
+                      if (e.key !== 'Enter' && e.key !== ' ') return
+                      e.preventDefault()
+                      e.stopPropagation()
+                      const next = targets[(index + 1) % targets.length]
+                      if (next) setSelectedWindow(next.window)
+                    },
+                    onClick: (e) => {
+                      // 别把点击透给父级，否则会触发跳转
+                      e.stopPropagation()
+                      const next = targets[(index + 1) % targets.length]
+                      if (next) setSelectedWindow(next.window)
+                    },
+                  },
+                  index + 1 + '/' + targets.length,
+                )
+              : null,
+          ),
+        ),
       )
     }
 
