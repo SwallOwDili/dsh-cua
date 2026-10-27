@@ -1,6 +1,6 @@
 {
   "name": "dsh-cua",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "macOS Computer Use for DeepSeek Harness — native AX tree, screenshot, and input injection as MCP tools",
   "type": "module",
   "main": "./index.js",
@@ -16,8 +16,10 @@
     "cordis.patch.yml",
     "bin/cua-mcp",
     "bin/cua-overlay",
+    "bin/cua-live",
     "src/main.swift",
     "overlay/main.swift",
+    "live/main.swift",
     "build.sh",
     "README.md"
   ],

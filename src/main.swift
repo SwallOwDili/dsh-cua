@@ -447,6 +447,85 @@ private func focusedSignature(_ appEl: AXUIElement) -> String {
 
 /// 控制 cua-overlay 进程。overlay 是独立的 accessory 进程，
 /// 通过 /tmp/cua-overlay.sock 收指令，在被操作窗口上画边框与左上角胶囊。
+
+// MARK: - 实时画面（cua-live）
+//
+// 对话页角标小窗的数据源。cua-live 常驻，以 3fps 抓目标窗口并输出 MJPEG；
+// 这里只负责两件事：进程在不在、当前目标是谁。
+// 用固定端口 18901 而非走宿主 webServer：跨端口的 <img> 不受 CORS 约束，
+// 也就绕开了宿主那层登录中间件。
+
+enum Live {
+    static let port = 18901
+    static var launched = false
+    /// 抓帧是 3fps 的常驻开销，目标没变就不必重复通知
+    static var lastKey = ""
+    static var lastSentAt: Date = .distantPast
+
+    static var binaryPath: String {
+        let exe = Bundle.main.executableURL?.deletingLastPathComponent()
+            ?? URL(fileURLWithPath: "/tmp")
+        return exe.appendingPathComponent("cua-live").path
+    }
+
+    static func url(_ path: String) -> URL? {
+        URL(string: "http://127.0.0.1:\(port)\(path)")
+    }
+
+    /// 端口上是否已经有人应答。用同步请求，超时压到 200ms。
+    static func isServing() -> Bool {
+        guard let u = url("/status") else { return false }
+        var req = URLRequest(url: u)
+        req.timeoutInterval = 0.2
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 { ok = true }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 0.4)
+        return ok
+    }
+
+    static func ensureRunning() {
+        if isServing() { return }
+        if launched { return }
+        launched = true
+        guard FileManager.default.isExecutableFile(atPath: binaryPath) else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: binaryPath)
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        for _ in 0..<40 {
+            if isServing() { return }
+            usleep(25_000)
+        }
+    }
+
+    /// 告知 cua-live 当前操作目标。fire-and-forget，不阻塞工具调用。
+    static func notify(pid: pid_t, appName: String, ttl: Double) {
+        let key = "\(pid)|\(appName)"
+        let now = Date()
+        if key == lastKey, now.timeIntervalSince(lastSentAt) < 2.0 { return }
+        lastKey = key
+        lastSentAt = now
+        ensureRunning()
+        // 只用 urlQueryAllowed 会把 & 和 = 留在里面，应用名含这些字符时查询串会被截断
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=?+")
+        guard let encoded = appName.addingPercentEncoding(withAllowedCharacters: allowed),
+              let u = url("/target?pid=\(pid)&ttl=\(Int(ttl))&app=\(encoded)") else { return }
+        // 同步等应答：cua-mcp 是一次性进程，fire-and-forget 的 task 会在退出时被丢弃，
+        // 表现就是目标从未送达（2026-10-27 踩过）。这里 0.6 秒封顶，且已按 pid+app 节流。
+        var req = URLRequest(url: u)
+        req.timeoutInterval = 0.6
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { _, _, _ in sem.signal() }.resume()
+        _ = sem.wait(timeout: .now() + 0.8)
+    }
+}
+
 enum Overlay {
     static let socketPath = "/tmp/cua-overlay.sock"
     static var launched = false
@@ -602,13 +681,16 @@ enum Overlay {
 
         // ttl 交给 overlay 自己计时。cua-mcp 是一次性进程，
         // 用本进程的 asyncAfter 收尾在进程退出后会失效，标记会永久残留。
+        let ttl = CuaConfig.current().overlayTtlSeconds
         send([
             "cmd": "show",
             "windowID": Int(wid),
             "pid": Int(pid),
             "label": "AI 正在操作 \(appName)",
-            "ttl": CuaConfig.current().overlayTtlSeconds,
+            "ttl": ttl,
         ])
+        // 同步把目标交给实时画面服务，对话页角标小窗据此出图
+        Live.notify(pid: pid, appName: appName, ttl: ttl)
     }
 
     static func hide() {

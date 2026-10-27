@@ -2,7 +2,7 @@
 # 构建 dsh-cua 的原生 MCP 服务器。
 #
 # 只依赖系统自带的 Swift 工具链（Xcode Command Line Tools），不需要额外 SDK。
-# 输出：bin/cua-mcp
+# 输出：bin/cua-mcp、bin/cua-overlay、bin/cua-live
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -40,8 +40,10 @@ build_universal() {
 build_universal "$OUT" "$SRC" || { echo "编译失败: $SRC" >&2; exit 1; }
 
 # overlay：被操作窗口左上角的标记进程
+LIVE_OUT="bin/cua-live"
 OVERLAY_OUT="bin/cua-overlay"
 build_universal "$OVERLAY_OUT" overlay/main.swift || { echo "编译失败: overlay" >&2; exit 1; }
+build_universal "$LIVE_OUT" live/main.swift || { echo "编译失败: live" >&2; exit 1; }
 
 echo "已生成 $OUT"
 echo "--- 自检 ---"
@@ -63,8 +65,9 @@ fi
 if [ -d "$INSTALLED_DIR" ]; then
   install -m 755 "$OUT" "$INSTALLED_DIR/bin/cua-mcp"
   install -m 755 "$OVERLAY_OUT" "$INSTALLED_DIR/bin/cua-overlay"
+  install -m 755 "$LIVE_OUT" "$INSTALLED_DIR/bin/cua-live"
   # package.json 常是硬链接，install 会因 "same file" 失败；cmp 相同就跳过。
-  for f in cordis.patch.yml package.json index.js README.md; do
+  for f in cordis.patch.yml package.json index.js client.js README.md; do
     if ! cmp -s "$f" "$INSTALLED_DIR/$f" 2>/dev/null; then
       cp -f "$f" "$INSTALLED_DIR/$f" 2>/dev/null || true
     fi

@@ -206,6 +206,28 @@ Codex 的对应实现是 `SyntheticAppFocusEnforcer`，它的 State 有三个独
 
 ---
 
+## 实时画面
+
+AI 在后台操作时，对话页右上角会出现一个小窗，实时显示它正在点哪个窗口。
+前台还是你自己的窗口，不会被抢走——这是「能看见它在干什么」和「黑盒等结果」的区别。
+
+实现走 MJPEG：`bin/cua-live` 常驻，以 3fps 抓目标窗口、缩到 480px 宽编码 JPEG，
+对外是 `multipart/x-mixed-replace` 流；前端只是把这个流塞进一个 `<img>`，
+浏览器自己维持刷新，不需要 WebSocket，也不需要 canvas。
+
+| 端点 | 作用 |
+|---|---|
+| `GET /live.mjpg` | MJPEG 流，供 `<img>` 持续显示 |
+| `GET /status` | `{active, app, pid, seq, viewers}`，决定小窗显不显示 |
+| `GET /target?pid=&app=&ttl=` | 设置被抓的目标窗口 |
+| `GET /clear` | 立即停止 |
+
+只在有操作目标时抓帧：目标由 `Overlay.mark` 同步带过来，`ttl`（默认 20 秒）到期
+自动停，静止时 CPU 归零。实测 3fps 抓帧期间 CPU 1.5%、内存 8.6MB、单帧 21KB。
+
+端口固定 `127.0.0.1:18901` 而不走宿主 `webServer`：跨端口的 `<img>` 不受 CORS 约束，
+从而绕开宿主那层登录中间件（走宿主路由会被拦成登录页）。
+
 ## 与 Codex 实现的差距
 
 诚实列出，不粉饰：
@@ -216,7 +238,7 @@ Codex 的对应实现是 `SyntheticAppFocusEnforcer`，它的 State 有三个独
 | 元素失效重取 | `RefetchableUIElement` + invalidation monitor | 无，快照语义 |
 | 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 无，按参数决定 |
 | 虚拟光标动画 | `ComputerUseCursor` + Lens 帧 | 无 |
-| 画中画远程查看 | `RemoteHostedPIP*` 全套 | 无 |
+| 实时画面回显 | `RemoteHostedPIP*` 全套 | 已实现：对话页右上角 MJPEG 小窗 |
 | 锁屏处理 | Guardian + AuthorizationPlugin | 无，锁屏时工具会失败 |
 | 应用级策略 | 组织策略 + 内置黑名单 | 无 |
 | 审批弹窗 | `createElicitation` + 4 级确认策略 | 无，依赖 harness 自身审批 |

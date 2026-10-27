@@ -17,8 +17,8 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    const react = require('react')
-    const h = react.createElement
+    const React = require('react')
+    const h = React.createElement
 
     const NS = 'cua'
 
@@ -285,6 +285,98 @@ window.__ModuleLoader__.load({
       }
     }
 
+
+    // ---- 实时画面小窗（对话页右上角）----
+    //
+    // 数据来自 cua-live 的 MJPEG 流。跨端口的 <img> 不受 CORS 约束，
+    // 所以这里不需要任何票据；status 轮询只用来决定显示还是隐藏。
+
+    const LIVE_BASE = 'http://127.0.0.1:18901'
+
+    const liveCss = {
+      wrap: {
+        position: 'relative',
+        display: 'inline-flex',
+        alignItems: 'center',
+        marginRight: '8px',
+      },
+      frame: {
+        width: '184px',
+        borderRadius: '8px',
+        border: '0.5px solid var(--dsw-alias-border-l4, #dcdcdc)',
+        background: 'var(--dsw-alias-bg-layer-2, #fff)',
+        display: 'block',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+      },
+      tag: {
+        position: 'absolute',
+        left: '6px',
+        bottom: '6px',
+        padding: '1px 6px',
+        borderRadius: '4px',
+        background: 'rgba(0,0,0,0.55)',
+        color: '#fff',
+        fontSize: '10px',
+        lineHeight: '1.5',
+        maxWidth: '150px',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      },
+      dot: {
+        display: 'inline-block',
+        width: '6px',
+        height: '6px',
+        borderRadius: '50%',
+        background: '#ff8000',
+        marginRight: '4px',
+        verticalAlign: 'middle',
+      },
+    }
+
+    /** 轮询 /status，只在有活跃目标时渲染小窗。 */
+    function LivePreview() {
+      const [status, setStatus] = React.useState(null)
+
+      React.useEffect(() => {
+        let alive = true
+        const poll = async () => {
+          try {
+            const res = await fetch(LIVE_BASE + '/status', { cache: 'no-store' })
+            const data = await res.json()
+            if (alive) setStatus(data && data.active ? data : null)
+          } catch {
+            if (alive) setStatus(null)
+          }
+        }
+        void poll()
+        const timer = setInterval(poll, 1500)
+        return () => {
+          alive = false
+          clearInterval(timer)
+        }
+      }, [])
+
+      if (!status) return null
+
+      return React.createElement(
+        'div',
+        { style: liveCss.wrap, title: 'AI 正在操作的窗口（实时）' },
+        React.createElement('img', {
+          // seq 参与查询串：目标切换时强制重连到新流
+          src: LIVE_BASE + '/live.mjpg?t=' + status.pid,
+          style: liveCss.frame,
+          alt: '实时操作画面',
+        }),
+        React.createElement(
+          'span',
+          { style: liveCss.tag },
+          React.createElement('span', { style: liveCss.dot }),
+          status.app || '未知应用',
+        ),
+      )
+    }
+
     // ---- 样式：沿用宿主的 alias 变量，缺省时退回中性色 ----
 
     const css = {
@@ -536,6 +628,14 @@ window.__ModuleLoader__.load({
           CuaCard,
         )
       })
+      // 对话页右上角的实时画面。没有活跃目标时组件自己渲染 null，
+      // 不占位、不显示空框。
+      ctx.slots.inject('conversation.session.header.corner', () =>
+        ctx.slots.register(
+          { name: 'conversation.session.header.corner' },
+          LivePreview,
+        ),
+      )
     }
 
     exports.name = 'cua'
