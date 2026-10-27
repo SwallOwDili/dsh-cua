@@ -284,7 +284,8 @@ final class LiveState {
         lock.lock()
         defer { lock.unlock() }
         sweepLocked()
-        var list = targets.values.sorted { $0.windowID < $1.windowID }
+        // 最近被操作的排前面：同时操作多个应用时，最上面应该是刚动过的那个
+        var list = targets.values.sorted { $0.expiresAt > $1.expiresAt }
         // 带 session 查询就只返回该会话的目标；空 session 的旧目标不认领
         if let s = session, !s.isEmpty {
             list = list.filter { $0.session == s }
