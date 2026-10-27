@@ -127,6 +127,18 @@ export class McpBridge extends EventEmitter {
     })
   }
 
+  /**
+   * 保证子进程活着。二进制被重新构建后，旧进程跑的还是旧代码，
+   * 而它是常驻的、不会自己换新——所以调用前兜底重启一次。
+   */
+  async ensureReady() {
+    if (this.isRunning) return
+    this.#closed = false
+    this.#buffer = ''
+    this.start()
+    await this.initialize()
+  }
+
   async initialize() {
     await this.request('initialize', {
       protocolVersion: '2025-06-18',
@@ -145,6 +157,7 @@ export class McpBridge extends EventEmitter {
    * 用来把目标窗口归属到发起操作的会话。
    */
   async callTool(name, args, sessionId) {
+    await this.ensureReady()
     const params = { name, arguments: args ?? {} }
     if (sessionId) params._meta = { sessionId: String(sessionId) }
     const result = await this.request('tools/call', params)
