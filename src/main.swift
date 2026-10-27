@@ -2240,7 +2240,9 @@ func resolvePoint(_ args: [String: Any], pid: pid_t) throws -> CGPoint {
 
 func toolOpenApp(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let q = args["app"] as? String else { throw CUAError.badRequest("app 必填") }
-    let activate = (args["activate"] as? Bool) ?? true
+    // 默认不激活：打开应用不该夺走用户当前的键盘焦点。
+    // 需要真前置（例如紧接着要点击）时由调用方显式传 activate: true。
+    let activate = (args["activate"] as? Bool) ?? false
 
     var ref = try? resolveApp(q)
     if ref == nil {
@@ -2268,6 +2270,8 @@ func toolOpenApp(_ args: [String: Any]) throws -> [[String: Any]] {
                      name: app.localizedName ?? "",
                      path: url.path)
     } else if activate, let app = NSRunningApplication(processIdentifier: ref!.pid) {
+        // 只有显式要求时才真激活。合成激活（AXFrontmost）对部分应用
+        // （计算器、访达）同样会触发真实前置，所以默认干脆不碰。
         app.activate(options: [])
         usleep(200_000)
     }
