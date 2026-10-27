@@ -84,6 +84,12 @@ export const RuntimeSettings = Schema.object({
         '用户正在用的窗口不会被抢走。' +
         '关闭后不主动激活，遇到不认事件的目标应用可能操作无效。',
     ),
+  historyEnabled: Schema.boolean()
+    .default(true)
+    .description(
+      '记录每次工具调用到 ~/.dsh/dsh-cua-history（时间、工具、目标应用、耗时、脱敏参数），' +
+        '并按段聚合出 memory.md。关闭后不再写入，已有历史保留。',
+    ),
   deniedBundleIDs: Schema.array(Schema.string())
     .default([])
     .description('禁止操作的应用 bundleID 列表。命中即在分发层拒绝，动作不会落到目标应用。'),

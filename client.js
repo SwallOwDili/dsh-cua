@@ -73,6 +73,12 @@ window.__ModuleLoader__.load({
         hint: '操作前让目标应用「自认为」前台，但不抢走你正在用的窗口。',
       },
       {
+        field: 'historyEnabled',
+        kind: 'boolean',
+        label: '记录操作历史',
+        hint: '写入 ~/.dsh/dsh-cua-history；参数脱敏，密码与输入内容不落盘。',
+      },
+      {
         field: 'deniedBundleIDs',
         kind: 'list',
         label: '禁止操作的应用',

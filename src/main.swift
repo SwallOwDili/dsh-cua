@@ -196,6 +196,8 @@ enum History {
 
     /// 追加一条活动事件。段满则滚动。
     static func record(tool: String, args: [String: Any], app: String?, status: String, ms: Int) {
+        // 两道闸：配置页的总开关（持久）与 history 工具的临时暂停
+        guard CuaConfig.current().historyEnabled else { return }
         let st = loadSettings()
         guard st.enabled, !st.paused else { return }
         if let b = args["app"] as? String, st.ignoredBundleIDs.contains(b) { return }
@@ -255,7 +257,7 @@ enum History {
         let archived = (try? FileManager.default.contentsOfDirectory(atPath: archivedDir.path))?
             .filter { $0.hasSuffix(".jsonl") }.count ?? 0
         return [
-            "enabled": st.enabled,
+            "enabled": CuaConfig.current().historyEnabled && st.enabled,
             "paused": st.paused,
             "path": root.path,
             "current": countEvents(),
@@ -334,6 +336,7 @@ struct RuntimeConfig: Decodable {
     var scrollStepPx: Int = 40
     var maxElements: Int = 4000
     var syntheticActivate: Bool = true
+    var historyEnabled: Bool = true
     var deniedBundleIDs: [String] = []
     var allowedBundleIDs: [String] = []
 
@@ -343,7 +346,7 @@ struct RuntimeConfig: Decodable {
     enum CodingKeys: String, CodingKey {
         case browserCdpPort, browserCdpHost, overlayEnabled, overlayTtlSeconds
         case backgroundSilence, scrollStepPx, maxElements
-        case syntheticActivate, deniedBundleIDs, allowedBundleIDs
+        case syntheticActivate, historyEnabled, deniedBundleIDs, allowedBundleIDs
     }
 
     init() {}
@@ -358,6 +361,7 @@ struct RuntimeConfig: Decodable {
         scrollStepPx = (try? c.decodeIfPresent(Int.self, forKey: .scrollStepPx)).flatMap { $0 } ?? 40
         maxElements = (try? c.decodeIfPresent(Int.self, forKey: .maxElements)).flatMap { $0 } ?? 4000
         syntheticActivate = (try? c.decodeIfPresent(Bool.self, forKey: .syntheticActivate)).flatMap { $0 } ?? true
+        historyEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .historyEnabled)).flatMap { $0 } ?? true
         deniedBundleIDs = (try? c.decodeIfPresent([String].self, forKey: .deniedBundleIDs)).flatMap { $0 } ?? []
         allowedBundleIDs = (try? c.decodeIfPresent([String].self, forKey: .allowedBundleIDs)).flatMap { $0 } ?? []
     }

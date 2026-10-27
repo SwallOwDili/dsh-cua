@@ -323,6 +323,9 @@ EOF
 记录内容：时间、工具名、目标应用、耗时、脱敏后的参数。段满（默认 500 条）自动归档，
 并重新聚合 `memory.md`。
 
+开关分两层：设置页的「记录操作历史」是总开关（持久，关掉后文件不再增长、已有历史保留）；
+`history` 工具的 `pause` 是临时暂停，适合一口气做一串不希望留痕的操作。
+
 工具 `history` 的动作：`status`、`pause`、`resume`、`clear`、`settings`。
 
 **脱敏是硬约束**，对标 `SkysightSummarizer.md` 的规定：
@@ -394,6 +397,7 @@ toolCallTimeoutMs: 180000     # 单次调用超时，截图慢时可加
 | `scrollStepPx` | `40` | 滚动单步像素；过大时 Catalyst 应用会丢事件 |
 | `maxElements` | `4000` | 单次快照的节点上限，超出截断 |
 | `syntheticActivate` | `true` | 操作前让目标「自认为」前台，但不抢走用户窗口 |
+| `historyEnabled` | `true` | 记录操作历史到 `~/.dsh/dsh-cua-history`；关闭后不再写入，已有历史保留 |
 | `deniedBundleIDs` | `[]` | 禁止操作的应用；命中即在分发层拒绝 |
 | `allowedBundleIDs` | `[]` | 只允许操作的应用；非空时其余一律拒绝，优先级高于禁止列表 |
 
