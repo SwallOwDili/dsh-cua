@@ -36,6 +36,8 @@ struct Target {
     var appName: String
     var windowID: CGWindowID
     var expiresAt: Date
+    /// 发起这次操作的会话。前端按它过滤，预览只出现在对应会话里。
+    var session: String = ""
 }
 
 private var windowCache: [pid_t: (CGWindowID, Date)] = [:]
@@ -140,7 +142,7 @@ final class LiveState {
     /// 客户端订阅：一条连接只收它指定的窗口（nil 表示收任意窗口）。
     private var clients: [(conn: NWConnection, window: CGWindowID?)] = []
 
-    func setTarget(pid: pid_t, appName: String, ttl: Double, explicit: CGWindowID?) {
+    func setTarget(pid: pid_t, appName: String, ttl: Double, explicit: CGWindowID?, session: String = "") {
         guard let wid = explicit ?? windowID(for: pid) else { return }
         lock.lock()
         let existed = targets[wid] != nil
@@ -148,7 +150,8 @@ final class LiveState {
             pid: pid,
             appName: appName,
             windowID: wid,
-            expiresAt: Date().addingTimeInterval(ttl)
+            expiresAt: Date().addingTimeInterval(ttl),
+            session: session
         )
         lock.unlock()
         if !existed {
@@ -277,16 +280,22 @@ final class LiveState {
     }
 
     /// 每个目标加上帧信息，供 /status 一次性返回。
-    func snapshot() -> [[String: Any]] {
+    func snapshot(session: String?) -> [[String: Any]] {
         lock.lock()
         defer { lock.unlock() }
         sweepLocked()
-        return targets.values.sorted { $0.windowID < $1.windowID }.map { t in
+        var list = targets.values.sorted { $0.windowID < $1.windowID }
+        // 带 session 查询就只返回该会话的目标；空 session 的旧目标不认领
+        if let s = session, !s.isEmpty {
+            list = list.filter { $0.session == s }
+        }
+        return list.map { t in
             let f = frames[t.windowID]
             return [
                 "app": t.appName,
                 "pid": Int(t.pid),
                 "window": Int(t.windowID),
+                "session": t.session,
                 "alive": f != nil,
                 "bytes": f?.jpeg.count ?? 0,
                 "seq": f?.seq ?? 0,
@@ -392,7 +401,7 @@ func handleConnection(_ conn: NWConnection) {
 
         switch (method, route) {
         case (_, "/status"):
-            let list = state.snapshot()
+            let list = state.snapshot(session: params["session"])
             conn.send(content: jsonResponse([
                 "active": !list.isEmpty,
                 "targets": list,
@@ -423,7 +432,8 @@ func handleConnection(_ conn: NWConnection) {
             let ttl = Double(params["ttl"] ?? "") ?? 20
             if pid > 0 {
                 let explicit = params["window"].flatMap { CGWindowID($0) }
-                state.setTarget(pid: pid, appName: app, ttl: ttl, explicit: explicit)
+                state.setTarget(pid: pid, appName: app, ttl: ttl,
+                                explicit: explicit, session: params["session"] ?? "")
             }
             let t = state.activeTarget(window: params["window"].flatMap { CGWindowID($0) })
             conn.send(content: jsonResponse([

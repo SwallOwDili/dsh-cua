@@ -1,9 +1,11 @@
 # dsh-cua — 把 Computer Use 装进 DeepSeek Harness
 #
-# 两条 insert：
-#   1. dsh-cua 自身 —— 让它在插件树里可见、可配，并承担启动时的 TCC 自检；
-#   2. mcp-computer-use —— @deepseek-ai/dsh-mcp-client 的一条服务器配置，
-#      把 bin/cua-mcp 这个 stdio MCP 服务器上的工具挂到 ctx.tools。
+# 只 insert dsh-cua 自身：它在插件树里可见、可配，承担启动时的 TCC 自检，
+# 并自己 spawn bin/cua-mcp 把工具挂到 ctx.tools。
+#
+# 不再用 @deepseek-ai/dsh-mcp-client 挂 cua-mcp：那个客户端构造 tools/call 时
+# 只发 name 和 arguments，不带会话上下文，导致 cua-mcp 无法把操作目标归属到会话，
+# 实时预览只能在所有对话里共享。自己起客户端才能把 exec.agent.id 放进 params._meta。
 #
 # 二进制路径：插件以 file: 依赖装进 profile 的 node_modules/dsh-cua/，
 # 因此相对 profile 根目录的路径是稳定的。`ctx.baseUrl` 是 profile 目录的
@@ -13,18 +15,3 @@
 - insert:
     - id: cua
       name: dsh-cua
-
-    - id: mcp-computer-use
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: computer_use
-        transport: stdio
-        command: !!js new URL('node_modules/dsh-cua/bin/cua-mcp', ctx.baseUrl).pathname
-        args: []
-        toolCallTimeoutMs: 180000
-        failOnStartupError: false
-        reconnect:
-          enabled: true
-          initialDelayMs: 500
-          maxDelayMs: 30000
-          maxAttempts: 10

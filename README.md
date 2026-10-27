@@ -22,6 +22,20 @@ Codex 的 Computer Use 服务有一条代码签名鉴权（`-10000 senderProcess
 
 ---
 
+## 工具怎么挂上去的
+
+插件自己 spawn `bin/cua-mcp`，用 `mcp-bridge.js` 做 stdio JSON-RPC 客户端，
+把 19 个工具注册到 `ctx.tools`。
+
+**为什么不用 `@deepseek-ai/dsh-mcp-client`**：它构造 `tools/call` 时只发
+`name` 和 `arguments`，不带会话上下文（见 `dsh-mcp-client/lib/index.js` 的
+`callToolUncached`）。这样 `cua-mcp` 无法知道这次操作是哪个会话发起的，
+实时预览就只能全局共享——切到别的对话还能看到上一个会话的目标窗口。
+
+自己发请求就能把 `exec.agent.id` 放进 MCP 的 `params._meta`：
+`cua-mcp` 读出来交给 `cua-live`，目标窗口就带上了会话归属，
+前端按当前会话过滤，预览只出现在该出现的那个对话里。
+
 ## 安装
 
 仓库已内置预编译二进制（`bin/cua-mcp`、`bin/cua-overlay`，universal：x86_64 + arm64），
@@ -290,7 +304,8 @@ AI 在后台操作时，对话页右上角会出现一个小窗，实时显示�
 只在有操作目标时抓帧：目标由 `Overlay.mark` 同步带过来，`ttl`（默认 20 秒）到期
 自动停，静止时 CPU 归零。实测 3fps 抓帧期间 CPU 1.5%、内存 8.6MB、单帧 21KB。
 
-**多个窗口同时被操作时，各出一个小窗**，纵向排列，互不覆盖。`/status` 返回 `targets`
+预览按会话隔离：`/status?session=<id>` 只返回该会话发起的操作目标。
+同一会话里多个窗口同时被操作时，**各出一个小窗**，纵向排列，互不覆盖。`/status` 返回 `targets`
 数组，`/live.mjpg?win=<窗口号>` 按窗口取流，`/focus?window=<窗口号>` 跳到对应窗口。
 
 点小窗直接跳到被操作的那个窗口：`/focus` 先把目标窗口 `AXRaise` 到应用内最前，

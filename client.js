@@ -392,14 +392,29 @@ window.__ModuleLoader__.load({
     }
 
     /** 轮询 /status，只在有活跃目标时渲染小窗。 */
-    function LivePreview() {
+    function LivePreview({ sessions }) {
       const [status, setStatus] = React.useState(null)
+      // 当前会话：只有本会话发起的操作才在这里出预览。
+      // cua-mcp 经 MCP _meta 带上会话标识，cua-live 按它归属目标窗口。
+      const [sessionId, setSessionId] = React.useState(
+        () => (sessions ? sessions.list.getSnapshot().current ?? '' : ''),
+      )
+
+      React.useEffect(() => {
+        if (!sessions) return undefined
+        const read = () => setSessionId(sessions.list.getSnapshot().current ?? '')
+        read()
+        return sessions.list.subscribe(read)
+      }, [sessions])
 
       React.useEffect(() => {
         let alive = true
+        // 换会话先清空：新会话还没查完之前不要继续显示上一个会话的画面
+        setStatus(null)
         const poll = async () => {
           try {
-            const res = await fetch(LIVE_BASE + '/status', { cache: 'no-store' })
+            const query = sessionId ? '?session=' + encodeURIComponent(sessionId) : ''
+            const res = await fetch(LIVE_BASE + '/status' + query, { cache: 'no-store' })
             const data = await res.json()
             if (alive) setStatus(data && data.active ? data : null)
           } catch {
@@ -412,7 +427,7 @@ window.__ModuleLoader__.load({
           alive = false
           clearInterval(timer)
         }
-      }, [])
+      }, [sessionId])
 
       if (!status) return null
 
@@ -709,7 +724,7 @@ window.__ModuleLoader__.load({
     }
 
     /** 需要的宿主服务：slot 注册表与 settings 作用域。 */
-    const inject = ['slots', 'settingsScope']
+    const inject = ['slots', 'settingsScope', 'sessions']
 
     /**
      * 挂载配置卡片。
@@ -734,10 +749,13 @@ window.__ModuleLoader__.load({
       })
       // 对话页右上角的实时画面。没有活跃目标时组件自己渲染 null，
       // 不占位、不显示空框。
+      // 会话服务在 apply 时已就绪（inject 声明过），闭包传给组件；
+      // slot 的 renderSlot 只传空 props，拿不到会话上下文。
+      const sessions = ctx.sessions
       ctx.slots.inject('conversation.session.header.corner', () =>
         ctx.slots.register(
           { name: 'conversation.session.header.corner' },
-          LivePreview,
+          () => h(LivePreview, { sessions }),
         ),
       )
     }

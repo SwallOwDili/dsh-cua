@@ -1225,6 +1225,10 @@ private func focusedSignature(_ appEl: AXUIElement) -> String {
 // 用固定端口 18901 而非走宿主 webServer：跨端口的 <img> 不受 CORS 约束，
 // 也就绕开了宿主那层登录中间件。
 
+/// 当前工具调用所属的会话。插件侧经 MCP 的 params._meta.sessionId 传进来，
+/// 用来把操作目标归属到会话，预览只在该会话显示。
+var currentSessionID: String = ""
+
 enum Live {
     static let port = 18901
     static var launched = false
@@ -1275,7 +1279,7 @@ enum Live {
 
     /// 告知 cua-live 当前操作目标。fire-and-forget，不阻塞工具调用。
     static func notify(pid: pid_t, appName: String, ttl: Double, windowID: CGWindowID? = nil) {
-        let key = "\(pid)|\(appName)|\(windowID.map(String.init) ?? "-")"
+        let key = "\(pid)|\(appName)|\(windowID.map(String.init) ?? "-")|\(currentSessionID)"
         let now = Date()
         if key == lastKey, now.timeIntervalSince(lastSentAt) < 2.0 { return }
         lastKey = key
@@ -1287,6 +1291,10 @@ enum Live {
         guard let encoded = appName.addingPercentEncoding(withAllowedCharacters: allowed) else { return }
         var query = "/target?pid=\(pid)&ttl=\(Int(ttl))&app=\(encoded)"
         if let w = windowID { query += "&window=\(w)" }
+        if !currentSessionID.isEmpty,
+           let sid = currentSessionID.addingPercentEncoding(withAllowedCharacters: allowed) {
+            query += "&session=\(sid)"
+        }
         guard let u = url(query) else { return }
         // 同步等应答：cua-mcp 是一次性进程，fire-and-forget 的 task 会在退出时被丢弃，
         // 表现就是目标从未送达（2026-10-27 踩过）。这里 0.6 秒封顶，且已按 pid+app 节流。
@@ -2812,6 +2820,10 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
             throw CUAError.badRequest("缺少工具名")
         }
         let callStart = Date()
+        if let meta = params["_meta"] as? [String: Any],
+           let sid = meta["sessionId"] as? String {
+            currentSessionID = sid
+        }
         let args = (params["arguments"] as? [String: Any]) ?? [:]
         // 锁屏时所有依赖 AX / 截屏 / 注入的工具都会失败，先给准确原因
         if isScreenLocked(), name != "list_apps", name != "screen_state", name != "unlock_screen" {

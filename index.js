@@ -18,6 +18,7 @@
  */
 
 import { existsSync, accessSync, constants, writeFileSync } from 'node:fs'
+import { McpBridge, toParameters, toText } from './mcp-bridge.js'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
@@ -133,7 +134,7 @@ function runSelfTest(binary) {
   }
 }
 
-export function apply(ctx, config) {
+export async function apply(ctx, config) {
   const binary = resolveBinary(config)
 
   if (process.platform !== 'darwin') {
@@ -159,6 +160,63 @@ export function apply(ctx, config) {
 
   // 把路径注册成 cordis 服务，其它插件可经 ctx.get('cuaBinary') 复用同一二进制。
   ctx.provide('cuaBinary', binary)
+
+  // ---- 工具桥接：自己接 cua-mcp，而不是交给 dsh-mcp-client ----
+  //
+  // 原因见 mcp-bridge.js 顶部：dsh-mcp-client 构造 tools/call 时不带会话上下文，
+  // cua-mcp 因此无法把操作目标归属到会话，实时预览只能全局共享——
+  // 切到别的对话还能看到上一个会话的目标窗口。
+  // 自己发请求就能把 exec.agent.id 放进 params._meta 带过去。
+  const bridge = new McpBridge(binary)
+  bridge.on('stderr', (chunk) => {
+    for (const line of String(chunk).split('\n')) {
+      if (line.trim()) ctx.logger?.debug?.(`dsh-cua: ${line.trim()}`)
+    }
+  })
+  bridge.on('error', (error) => {
+    ctx.logger?.error?.(`dsh-cua: cua-mcp 异常 — ${error.message}`)
+  })
+
+  ctx.effect(() => () => bridge.stop(), 'dsh-cua: cua-mcp 生命周期')
+  bridge.start()
+
+  try {
+    await bridge.initialize()
+    const tools = await bridge.listTools()
+    const disposers = []
+    for (const tool of tools) {
+      disposers.push(
+        ctx.tools.register({
+          name: tool.name,
+          description: tool.description ?? '',
+          parameters: toParameters(tool.inputSchema),
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { text: { type: 'string', required: true } },
+              required: ['text'],
+            },
+            render: (_args, value) => [{ type: 'text', text: value.text }],
+          },
+          execute: async (args, exec) => {
+            // exec.agent.id 就是发起这次调用的会话；后台任务可能没有 agent
+            const sessionId = exec?.agent?.id
+            const result = await bridge.callTool(tool.name, args, sessionId)
+            const text = toText(result)
+            if (result?.isError) throw new Error(text || `${tool.name} 执行失败`)
+            return { text }
+          },
+        }),
+      )
+    }
+    ctx.effect(() => () => {
+      for (const dispose of disposers) dispose()
+    }, 'dsh-cua: 工具注销')
+    ctx.logger?.info?.(`dsh-cua: 已挂载 ${tools.length} 个工具`)
+  } catch (error) {
+    ctx.logger?.error?.(`dsh-cua: 挂载工具失败 — ${error.message}`)
+  }
 
   // ---- 配置页：等 settings 就绪后注册命名空间，把值落盘给 cua-mcp ----
   // 用 ctx.inject 而不是顶层 inject：插件本体不等服务，工具照常可用。

@@ -67,7 +67,7 @@ if [ -d "$INSTALLED_DIR" ]; then
   install -m 755 "$OVERLAY_OUT" "$INSTALLED_DIR/bin/cua-overlay"
   install -m 755 "$LIVE_OUT" "$INSTALLED_DIR/bin/cua-live"
   # package.json 常是硬链接，install 会因 "same file" 失败；cmp 相同就跳过。
-  for f in cordis.patch.yml package.json index.js client.js README.md; do
+  for f in cordis.patch.yml package.json index.js client.js mcp-bridge.js README.md; do
     if ! cmp -s "$f" "$INSTALLED_DIR/$f" 2>/dev/null; then
       cp -f "$f" "$INSTALLED_DIR/$f" 2>/dev/null || true
     fi
