@@ -323,6 +323,18 @@ window.__ModuleLoader__.load({
         textOverflow: 'ellipsis',
         whiteSpace: 'nowrap',
       },
+      checker: {
+        borderRadius: '8px',
+        border: '0.5px solid var(--dsw-alias-border-l4, #dcdcdc)',
+        backgroundImage: 'repeating-conic-gradient(#ececec 0% 25%, #fafafa 0% 50%)',
+        backgroundSize: '12px 12px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: '#8a8a8a',
+        fontSize: '10px',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.10)',
+      },
       dot: {
         display: 'inline-block',
         width: '6px',
@@ -359,15 +371,36 @@ window.__ModuleLoader__.load({
 
       if (!status) return null
 
+      // 高度按真实帧比例算：目标窗口换形状时小窗跟着变形，
+      // 而不是把内容硬塞进固定的 184×? 里。
+      const fw = status.width > 0 ? status.width : 0
+      const fh = status.height > 0 ? status.height : 0
+      const ratio = fw > 0 && fh > 0 ? fh / fw : 0.62
+      const boxW = 184
+      const boxH = Math.max(56, Math.min(220, Math.round(boxW * ratio)))
+
+      const body = status.alive
+        ? React.createElement('img', {
+            // pid 参与查询串：目标切换时强制重连到新流
+            src: LIVE_BASE + '/live.mjpg?t=' + status.pid,
+            style: Object.assign({}, liveCss.frame, { width: boxW + 'px', height: boxH + 'px', objectFit: 'fill' }),
+            alt: '实时操作画面',
+          })
+        : React.createElement(
+            'div',
+            {
+              // 目标窗口关闭或最小化：不挂一张旧帧冒充实时画面，
+              // 换成占位格（对应 Codex 的 CheckerboardRenderer）
+              style: Object.assign({}, liveCss.checker, { width: boxW + 'px', height: boxH + 'px' }),
+              title: '目标窗口当前不可见',
+            },
+            '画面暂不可用',
+          )
+
       return React.createElement(
         'div',
         { style: liveCss.wrap, title: 'AI 正在操作的窗口（实时）' },
-        React.createElement('img', {
-          // seq 参与查询串：目标切换时强制重连到新流
-          src: LIVE_BASE + '/live.mjpg?t=' + status.pid,
-          style: liveCss.frame,
-          alt: '实时操作画面',
-        }),
+        body,
         React.createElement(
           'span',
           { style: liveCss.tag },

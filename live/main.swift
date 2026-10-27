@@ -82,9 +82,9 @@ func encodeJPEG(_ image: CGImage, quality: Double) -> Data? {
 }
 
 /// 抓一帧并缩到预览宽度。返回 nil 表示窗口消失或抓取失败。
-func capturePreview(windowID: CGWindowID) -> Data? {
+func capturePreview(windowID: CGWindowID) -> (data: Data, width: Int, height: Int)? {
     let sem = DispatchSemaphore(value: 0)
-    var out: Data?
+    var out: (Data, Int, Int)?
     Task {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(
@@ -106,7 +106,9 @@ func capturePreview(windowID: CGWindowID) -> Data? {
                 let img = try await SCScreenshotManager.captureImage(
                     contentFilter: filter, configuration: cfg
                 )
-                out = encodeJPEG(img, quality: jpegQuality)
+                if let enc = encodeJPEG(img, quality: jpegQuality) {
+                    out = (enc, img.width, img.height)
+                }
             }
         } catch {
             out = nil
@@ -126,6 +128,12 @@ final class LiveState {
     private var clients: [NWConnection] = []
     private var sequence = 0
     private var capturing = false
+    private var frameWidth = 0
+    private var frameHeight = 0
+    /// 连续抓不到帧的次数。窗口关掉或最小化后，旧帧会一直挂在 latest 上，
+    /// 前端看起来像「画面卡住」；超过阈值就判定内容失效，让前端切到占位。
+    private var missStreak = 0
+    private let missLimit = 5
 
     func setTarget(pid: pid_t, appName: String, ttl: Double, explicit: CGWindowID?) {
         guard let wid = explicit ?? windowID(for: pid) else { return }
@@ -184,8 +192,22 @@ final class LiveState {
         lock.unlock()
     }
 
-    func publish(_ jpeg: Data, target: Target) {
+    func noteMiss() {
         lock.lock()
+        missStreak += 1
+        if missStreak >= missLimit {
+            latest = nil
+            frameWidth = 0
+            frameHeight = 0
+        }
+        lock.unlock()
+    }
+
+    func publish(_ jpeg: Data, target: Target, width: Int, height: Int) {
+        lock.lock()
+        missStreak = 0
+        frameWidth = width
+        frameHeight = height
         guard let current = self.target,
               current.windowID == target.windowID,
               Date() < current.expiresAt else {
@@ -231,15 +253,22 @@ final class LiveState {
         return clients.count
     }
 
-    func frameSize() -> (Int, Int) {
+    /// 返回 (字节数, 序号, 宽, 高)。宽高为 0 表示当前没有可用画面。
+    func frameInfo() -> (bytes: Int, seq: Int, width: Int, height: Int) {
         lock.lock()
         defer { lock.unlock() }
-        return (latest?.count ?? 0, sequence)
+        return (latest?.count ?? 0, sequence, frameWidth, frameHeight)
     }
 }
 
 let state = LiveState()
 let workQueue = DispatchQueue(label: "cua.live.server")
+
+// CGWindowList / SCK 都要求进程已建立 WindowServer 连接。
+// 纯 CLI 进程不建这个连接，首次在多线程里调 CG API 会直接断言
+// `CGS_REQUIRE_INIT`（2026-10-27 踩过，表现为 Abort trap 6）。
+// 启动时在主线程摸一次 CGMainDisplayID，把连接建起来。
+_ = CGMainDisplayID()
 
 // MARK: - HTTP
 
@@ -301,13 +330,17 @@ func handleConnection(_ conn: NWConnection) {
         switch (method, route) {
         case (_, "/status"):
             let t = state.activeTarget()
-            let (bytes, seq) = state.frameSize()
+            let info = state.frameInfo()
+            let t2 = state.activeTarget()
             conn.send(content: jsonResponse([
-                "active": t != nil,
-                "app": t?.appName ?? "",
-                "pid": t.map { Int($0.pid) } ?? 0,
-                "seq": seq,
-                "bytes": bytes,
+                "active": t2 != nil,
+                "alive": info.bytes > 0,
+                "app": t2?.appName ?? "",
+                "pid": t2.map { Int($0.pid) } ?? 0,
+                "seq": info.seq,
+                "bytes": info.bytes,
+                "width": info.width,
+                "height": info.height,
                 "viewers": state.clientCount(),
             ]), completion: .contentProcessed { _ in conn.cancel() })
 
@@ -359,8 +392,10 @@ pumpTimer.schedule(deadline: .now() + 0.1, repeating: frameInterval)
 pumpTimer.setEventHandler {
     guard let target = state.beginCapture() else { return }
     defer { state.endCapture() }
-    if let jpeg = capturePreview(windowID: target.windowID) {
-        state.publish(jpeg, target: target)
+    if let frame = capturePreview(windowID: target.windowID) {
+        state.publish(frame.data, target: target, width: frame.width, height: frame.height)
+    } else {
+        state.noteMiss()
     }
 }
 pumpTimer.resume()

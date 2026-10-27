@@ -40,6 +40,9 @@ final class CursorWindow: NSWindow {
 
 final class CursorView: NSView {
     var clickPulseStart: Date?
+    /// 移动光环起点。Codex 那边是 CursorSequence/LensSequence 的 PNG 帧序列，
+    /// 这里用现画的光环等效：移动到新位置时从尖端扩散一圈，0.35s 淡出。
+    var movePulseStart: Date?
 
     /// 指针形状：macOS 系统箭头的轮廓点（16 高缩放到 ~20pt）
     private let arrow: [NSPoint] = [
@@ -72,6 +75,22 @@ final class CursorView: NSView {
         path.lineWidth = 2.0
         path.stroke()
         ctx.restoreGState()
+
+        // 移动光环
+        if let t0 = movePulseStart {
+            let dt = Date().timeIntervalSince(t0)
+            if dt < 0.35 {
+                let k = CGFloat(dt / 0.35)
+                let r = 6 + 22 * k
+                let ring = NSBezierPath(ovalIn: NSRect(x: 0 - r, y: -r, width: r * 2, height: r * 2))
+                ring.lineWidth = 2.0 * (1 - k * 0.6)
+                cursorFill.withAlphaComponent(0.55 * (1 - k)).setStroke()
+                ring.stroke()
+                needsDisplay = true
+            } else {
+                movePulseStart = nil
+            }
+        }
 
         // 点击涟漪：从点击时刻起 0.45s 扩散淡出
         if let t0 = clickPulseStart {
@@ -127,7 +146,13 @@ final class CursorController {
             to = NSPoint(x: target.minX, y: target.minY)
             animStart = Date()
         }
+        pulseAtCurrent()
         startTimer()
+    }
+
+    func pulseAtCurrent() {
+        view.movePulseStart = Date()
+        view.needsDisplay = true
     }
 
     func click(at p: CGPoint) {

@@ -215,6 +215,10 @@ Codex 让长会话不炸上下文的两个设计，这里都补齐了。
 同一个控件每次拿到同一个编号。`get_app_state` 默认 `diff=auto`：有基线时只返回
 变化的节点，未变的沿用上轮 ID。实测同一界面第二次取状态从 62562 字符降到 1295 字符。
 
+输出用 `~` / `+` / `-` 标记变化、新增、移除；变化项只给「属性旧值→新值」。
+移除项按 ID 区间汇总（`ID 100-102,105`），不逐条吐原文——界面大改一次就是几十行。
+`diff=cumulative` 则与最初那棵树比较。
+
 **截图去重。** 8×8 灰度平均哈希比对上一帧，画面没变就不重复附图——
 一张 1600px 的截图要占上千 token，长会话里「界面没动也重发」是主要浪费。
 `diff=none` 取全量，`screenshot=always` 强制附图。
@@ -246,8 +250,26 @@ AI 在后台操作时，对话页右上角会出现一个小窗，实时显示�
 只在有操作目标时抓帧：目标由 `Overlay.mark` 同步带过来，`ttl`（默认 20 秒）到期
 自动停，静止时 CPU 归零。实测 3fps 抓帧期间 CPU 1.5%、内存 8.6MB、单帧 21KB。
 
+小窗尺寸按真实帧比例算，目标窗口换形状时跟着变形。`/status` 的 `width`/`height`
+给出当前帧尺寸，`alive: false` 表示目标窗口关掉或最小化了——此时前端显示占位格
+而不是一张旧帧冒充实时画面。
+
 端口固定 `127.0.0.1:18901` 而不走宿主 `webServer`：跨端口的 `<img>` 不受 CORS 约束，
 从而绕开宿主那层登录中间件（走宿主路由会被拦成登录页）。
+
+## 按应用提示
+
+特定应用的坑写在 `~/.dsh/dsh-cua-instructions/<bundleID>.md`，内容会插在快照
+`App:` 行之后，模型读节点前先看到。例：
+
+```bash
+mkdir -p ~/.dsh/dsh-cua-instructions
+cat > ~/.dsh/dsh-cua-instructions/com.apple.finder.md <<'EOF'
+列表视图可能一次吐出几千个节点，优先用 diff 模式。
+EOF
+```
+
+用文件而非内置表：应用差异得靠用的人补，硬编码追不上。
 
 ## 与 Codex 实现的差距
 
@@ -257,14 +279,14 @@ AI 在后台操作时，对话页右上角会出现一个小窗，实时显示�
 |---|---|---|
 | AX 树 diff | 三档 diff，省 token | 已实现：`diff=auto` 只报变化节点 |
 | 元素失效重取 | `RefetchableUIElement` + invalidation monitor | 已实现：结构路径指纹自动找回 |
-| 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 已实现：8×8 指纹相同则不重复附图 |
-| 虚拟光标动画 | `ComputerUseCursor` + Lens 帧 | 无 |
+| 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 部分：8×8 指纹相同则不重复附图 |
+| 虚拟光标动画 | `ComputerUseCursor` + Lens 帧 | 已实现：移动光环 + 点击涟漪（现画，非帧序列）|
 | 实时画面回显 | `RemoteHostedPIP*` 全套 | 已实现：对话页右上角 MJPEG 小窗 |
 | 锁屏处理 | Guardian + AuthorizationPlugin | 部分：检测并给出明确原因，不解锁 |
 | 应用级策略 | 组织策略 + 内置黑名单 | 无 |
 | 审批弹窗 | `createElicitation` + 4 级确认策略 | 无，依赖 harness 自身审批 |
 | 私有截图路径 | `captureScreenshotWithSkyLight` | 无，只用公开 SCK |
-| 每应用提示词 | `AppInstructions/*.md` | 无 |
+| 每应用提示词 | `AppInstructions/*.md` | 已实现：`~/.dsh/dsh-cua-instructions/<bundleID>.md` |
 
 前四项是 token 成本与稳定性优化，不影响功能正确性。
 后几项是产品化能力，需要时再补。

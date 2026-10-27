@@ -39,6 +39,9 @@ struct BaselineEntry {
     let line: String
 }
 var baselines: [pid_t: [String: BaselineEntry]] = [:]
+/// 每个 pid 的第一棵树。累积 diff（cumulative）拿它当基准，
+/// 对应 Codex 的 "cumulative diff from the initial accessibility tree"。
+var initialBaselines: [pid_t: [String: BaselineEntry]] = [:]
 
 
 // MARK: - 运行时配置（热读）
@@ -255,7 +258,7 @@ struct Snapshot {
     var isDiff = false
 }
 
-func captureTree(pid: pid_t, appName: String, useDiff: Bool = false) -> Snapshot {
+func captureTree(pid: pid_t, appName: String, diffMode: String = "none") -> Snapshot {
     let root = AXUIElementCreateApplication(pid)
 
     // 真正的焦点元素：AXCell 等容器会把自己的 focused 报成 true，不可直接采信，
@@ -368,7 +371,13 @@ func captureTree(pid: pid_t, appName: String, useDiff: Bool = false) -> Snapshot
 
     // 增量输出：与上一版基线逐 path 比对。
     // 未变化的节点不重复吐——id 已经稳定，模型手上还有上一轮那个编号。
-    let previous = baselines[pid] ?? [:]
+    // cumulative 与第一棵树比，auto 与上一次比
+    let previous: [String: BaselineEntry]
+    if diffMode == "cumulative" {
+        previous = initialBaselines[pid] ?? [:]
+    } else {
+        previous = baselines[pid] ?? [:]
+    }
     var fresh: [String: BaselineEntry] = [:]
     fresh.reserveCapacity(collected.count)
     for item in collected {
@@ -391,15 +400,16 @@ func captureTree(pid: pid_t, appName: String, useDiff: Bool = false) -> Snapshot
     snap.removed = 0
     snap.isDiff = false
 
-    if useDiff, !previous.isEmpty {
+    if diffMode != "none", !previous.isEmpty {
         var out: [String] = []
         var seen: Set<String> = []
+        var removedIDs: [Int] = []
         for item in collected {
             seen.insert(item.path)
             let content = fresh[item.path]!.line
             guard let old = previous[item.path] else {
                 snap.added += 1
-                out.append(item.line + "   ← 新增")
+                out.append("+ " + item.line.trimmingCharacters(in: .whitespaces))
                 continue
             }
             if old.line == content {
@@ -407,20 +417,30 @@ func captureTree(pid: pid_t, appName: String, useDiff: Bool = false) -> Snapshot
                 continue
             }
             snap.changed += 1
-            // 只报真正变化的属性，避免整行重读
+            // 紧凑标记：变化项只给「属性旧值→新值」，不重读整行
             let delta = attributeDelta(from: old.line, to: item.line)
-            out.append(item.line + "   ← 变化: " + delta)
+            out.append("~ " + item.line.trimmingCharacters(in: .whitespaces) + "  " + delta)
         }
         for (path, old) in previous where !seen.contains(path) {
             snap.removed += 1
-            out.append("[已移除] path=\(path) 原为: " + old.line.trimmingCharacters(in: .whitespaces))
+            removedIDs.append(old.id)
+            _ = path
+        }
+        // 移除项按 ID 区间汇总：Codex 那侧 axTreeDiffingRemovedElementIDRanges 的做法。
+        // 逐条给 path + 原文，界面大改一次就是几十行，压成区间只要一行。
+        if !removedIDs.isEmpty {
+            out.append("- 已移除 " + String(removedIDs.count) + " 项: ID " + compressRanges(removedIDs))
         }
 
         header += "Diff: 未变 \(snap.unchanged)，变化 \(snap.changed)，新增 \(snap.added)，移除 \(snap.removed)\n"
         if out.isEmpty {
             header += "（界面无变化）\n"
         } else {
-            header += "只列变化节点；未变节点沿用上轮的 elementID。需要全量请用 diff=none。\n"
+            if diffMode == "cumulative" {
+            header += "~ 变化，+ 新增，- 移除；基准是最初那棵树。全量用 diff=none。\n"
+        } else {
+            header += "~ 变化，+ 新增，- 移除；未变节点沿用上轮 elementID。全量用 diff=none。\n"
+        }
         }
         snap.text = header + out.joined(separator: "\n")
         snap.isDiff = true
@@ -429,6 +449,10 @@ func captureTree(pid: pid_t, appName: String, useDiff: Bool = false) -> Snapshot
     }
 
     baselines[pid] = fresh
+    // 第一棵树只记一次；累积模式一直以它为基准
+    if initialBaselines[pid] == nil {
+        initialBaselines[pid] = fresh
+    }
     return snap
 }
 
@@ -477,21 +501,55 @@ func resolvePath(pid: pid_t, path: String) -> AXUIElement? {
 /// 比较两行节点描述，列出真正变化的属性片段。
 /// 逐空格切分后按 "key" 对齐，避免整行重读浪费 token。
 func attributeDelta(from old: String, to new: String) -> String {
-    let strip: (String) -> [String] = { line in
+    let tokens: (String) -> [String] = { line in
         line.trimmingCharacters(in: .whitespaces)
             .split(separator: " ")
             .map(String.init)
             .filter { !$0.hasPrefix("[") && !$0.isEmpty }
     }
-    let a = strip(old), b = strip(new)
-    if a == b { return "位置/层级调整" }
-    let setA = Set(a), setB = Set(b)
-    let gone = a.filter { !setB.contains($0) && $0 != "←" }
-    let came = b.filter { !setA.contains($0) && $0 != "←" }
+    let a = tokens(old), b = tokens(new)
+    if a == b { return "(结构位置变化)" }
+    let setB = Set(b), setA = Set(a)
+    let gone = a.filter { !setB.contains($0) }
+    let came = b.filter { !setA.contains($0) }
+    // 同 key 的值变化写成 key 旧→新，比「去掉 X / 改为 Y」短一半
+    var pairs: [String] = []
+    for g in gone.prefix(3) {
+        if let eq = g.firstIndex(of: "=") {
+            let key = String(g[g.startIndex..<eq])
+            if let nv = came.first(where: { $0.hasPrefix(key + "=") }),
+               let ne = nv.firstIndex(of: "=") {
+                pairs.append(key + " " + String(g[g.index(after: eq)...]) + "→" + String(nv[nv.index(after: ne)...]))
+                continue
+            }
+        }
+        pairs.append("−" + g)
+    }
+    for c in came.prefix(3) {
+        if let eq = c.firstIndex(of: "="),
+           let key = Optional(String(c[c.startIndex..<eq])),
+           gone.contains(where: { $0.hasPrefix(key + "=") }) { continue }
+        if pairs.contains(where: { $0.hasPrefix(String(c[c.startIndex..<(c.firstIndex(of: "=") ?? c.endIndex)])) }) { continue }
+        pairs.append("+" + c)
+    }
+    return pairs.isEmpty ? "(顺序变化)" : pairs.joined(separator: " ")
+}
+
+/// 把一串 ID 压成区间：100,101,102,105 → "100-102,105"
+func compressRanges(_ ids: [Int]) -> String {
+    let sorted = Array(Set(ids)).sorted()
+    guard !sorted.isEmpty else { return "" }
     var parts: [String] = []
-    if !gone.isEmpty { parts.append("去掉 " + gone.prefix(3).joined(separator: " ")) }
-    if !came.isEmpty { parts.append("改为 " + came.prefix(3).joined(separator: " ")) }
-    return parts.isEmpty ? "属性顺序变化" : parts.joined(separator: " / ")
+    var start = sorted[0]
+    var prev = sorted[0]
+    for v in sorted.dropFirst() {
+        if v == prev + 1 { prev = v; continue }
+        parts.append(start == prev ? String(start) : "\(start)-\(prev)")
+        start = v
+        prev = v
+    }
+    parts.append(start == prev ? String(start) : "\(start)-\(prev)")
+    return parts.joined(separator: ",")
 }
 
 
@@ -1301,6 +1359,20 @@ func isScreenLocked() -> Bool {
     return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
 }
 
+
+// MARK: - 按应用提示
+
+/// 可选的按应用提示。放在 `~/.dsh/dsh-cua-instructions/<bundleID>.md`，
+/// 内容会插在快照头部，让模型取树之前先看到这个应用的坑。
+/// 用文件而非内置表：应用差异得靠用的人补，硬编码永远追不上。
+func appInstruction(bundleID: String) -> String? {
+    guard !bundleID.isEmpty else { return nil }
+    let path = NSHomeDirectory() + "/.dsh/dsh-cua-instructions/" + bundleID + ".md"
+    guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+}
+
 func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let q = args["app"] as? String else { throw CUAError.badRequest("app 必填") }
     let ref = try resolveApp(q)
@@ -1308,10 +1380,19 @@ func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
 
     // diff 默认 auto：有基线就只报变化，没基线（首次）自动退化成全量
     let diffMode = (args["diff"] as? String) ?? "auto"
-    let useDiff = diffMode != "none"
-    let snap = captureTree(pid: ref.pid, appName: ref.name, useDiff: useDiff)
+    let snap = captureTree(pid: ref.pid, appName: ref.name, diffMode: diffMode)
 
-    var content: [[String: Any]] = [["type": "text", "text": snap.text]]
+    var treeText = snap.text
+    if let tip = appInstruction(bundleID: ref.bundleID) {
+        // 插在 App 行之后：模型读节点前先看到这个应用的注意事项
+        var lines = treeText.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        if lines.count == 2 {
+            treeText = String(lines[0]) + "\n[应用提示] " + tip + "\n" + String(lines[1])
+        } else {
+            treeText = "[应用提示] " + tip + "\n" + treeText
+        }
+    }
+    var content: [[String: Any]] = [["type": "text", "text": treeText]]
 
     // screenshot 默认 auto：画面与上次同尺寸且采样指纹一致就不附图。
     // 图片按尺寸占 token，长会话里「界面没动也重发一张」是主要浪费。
@@ -1805,8 +1886,8 @@ let tools: [ToolDef] = [
             description: "获取应用的辅助功能树文本，以及一张截图。返回的 [数字] 是元素 ID，供后续动作使用。元素 ID 跨快照稳定，界面变化后仍可沿用。",
             schema: obj([
                 "app": appP,
-                "diff": ["type": "string", "enum": ["auto", "none"],
-                         "description": "auto（默认）：有基线时只返回变化的节点，未变的沿用上轮 ID；none：返回完整树"],
+                "diff": ["type": "string", "enum": ["auto", "cumulative", "none"],
+                         "description": "auto（默认）：只返回相对上一轮的变化，未变的沿用上轮 ID；cumulative：相对最初那棵树；none：完整树"],
                 "screenshot": ["type": "string", "enum": ["auto", "always", "never"],
                          "description": "auto（默认）：画面与上次一致时不重复附图；always/never 强制"],
                 "max_dimension": ["type": "integer", "description": "截图最长边像素，默认 1600"],
@@ -1976,6 +2057,8 @@ func selfTest() -> Int32 {
             }
         }
         print("path resolve: hit=\(hit) miss=\(miss)")
+        // ID 区间压缩自检：连续段合并，孤立项单列
+        print("range compress:", compressRanges([100, 101, 102, 105, 107, 108, 109]))
     }
 
     let cfg = CuaConfig.current()
