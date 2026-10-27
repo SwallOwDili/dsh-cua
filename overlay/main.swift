@@ -64,7 +64,7 @@ final class CursorView: NSView {
         sh.shadowOffset = NSSize(width: 0, height: 2)
         sh.shadowColor = NSColor.black.withAlphaComponent(0.45)
         sh.set()
-        cursorOrange.setFill()
+        cursorFill.setFill()
         path.fill()
         NSGraphicsContext.restoreGraphicsState()
 
@@ -82,7 +82,7 @@ final class CursorView: NSView {
                 let ring = NSBezierPath(
                     ovalIn: NSRect(x: cx - 8 - 30 * k, y: cy - 8 - 30 * k,
                                    width: 16 + 60 * k, height: 16 + 60 * k))
-                cursorOrange.withAlphaComponent(0.85 * (1 - k)).setStroke()
+                cursorFill.withAlphaComponent(0.85 * (1 - k)).setStroke()
                 ring.lineWidth = 3
                 ring.stroke()
             } else {
@@ -170,8 +170,10 @@ enum Overlay {
     static let version = "5"
 }
 let accent = NSColor(srgbRed: 0x33 / 255.0, green: 0x9C / 255.0, blue: 0xFF / 255.0, alpha: 1.0)
-/// 虚拟光标用品牌橙 #FF8000，尽可能在任何背景上突出，且与 Infuse/MiniPlayer 品牌色一致
-let cursorOrange = NSColor(srgbRed: 1.0, green: 128.0 / 255.0, blue: 0.0, alpha: 1.0)
+/// 虚拟光标与左上角标记共用同一个强调色。
+/// 早先用的是 #FF8000——那是从另一个项目（Infuse 逆向）串过来的品牌橙，
+/// 在这里没有任何依据，和标记的蓝撞成两套视觉。统一到 accent。
+let cursorFill = accent
 
 // MARK: - 标记视图
 
