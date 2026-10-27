@@ -314,6 +314,7 @@ EOF
 | 虚拟光标动画 | `ComputerUseCursor` + Lens 帧 | 已实现：移动光环 + 点击涟漪（现画，非帧序列）|
 | 实时画面回显 | `RemoteHostedPIP*` 全套 | 已实现：对话页右上角 MJPEG 小窗 |
 | 后台输入 | `postToPid` + `syntheticallyActivateIfNeeded` | 已实现：`AXFrontmost` 合成激活，元素点击优先 `AXPress` |
+| 交互前定位 | `prepareToInteract` + `waitUntilHasPrimaryWindow` | 已实现：等主窗口出现后再动手，光标跟到元素中心 |
 | 锁屏处理 | Guardian + AuthorizationPlugin | 已实现：检测 + 唤醒 + 可选密码解锁 |
 | 应用级策略 | 组织策略 + 内置黑名单 | 已实现：白/黑名单按 bundleID 拦在分发层 |
 | 审批弹窗 | `createElicitation` + 4 级确认策略 | 无，依赖 harness 自身审批 |

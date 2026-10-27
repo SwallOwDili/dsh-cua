@@ -1560,8 +1560,31 @@ func syntheticallyActivate(pid: pid_t, timeout: TimeInterval = 0.5) -> Bool {
     return false
 }
 
+
+/// 等目标应用有主窗口再动手。
+/// Codex 的 waitUntilHasPrimaryWindow(timeout:pollingInterval:)：冷启动或
+/// 窗口刚创建时 AX 树可能还没有窗口，此时点坐标会落到别处。
+func waitForPrimaryWindow(pid: pid_t, timeout: TimeInterval = 1.5) -> Bool {
+    let app = AXUIElementCreateApplication(pid)
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let w = attr(app, kAXMainWindowAttribute as String),
+           CFGetTypeID(w) == AXUIElementGetTypeID() {
+            return true
+        }
+        // 没有 AXMainWindow 的辅助应用，退一步看 AXWindows 是否非空
+        if let list = attr(app, kAXWindowsAttribute as String) as? [AXUIElement], !list.isEmpty {
+            return true
+        }
+        usleep(50_000)
+    }
+    return false
+}
+
 /// 动作前的统一前置：按配置决定是否合成激活。
 func prepareTarget(pid: pid_t) {
+    // 没有主窗口时先等，避免对着还没建好的界面操作
+    _ = waitForPrimaryWindow(pid: pid)
     guard CuaConfig.current().syntheticActivate else { return }
     guard !appIsFrontmost(pid: pid) else { return }
     _ = syntheticallyActivate(pid: pid)
@@ -1910,6 +1933,11 @@ func toolClick(_ args: [String: Any]) throws -> [[String: Any]] {
         // AXPress 是纯 AX 动作，不经过事件系统，窗口不会被升起。
         if actionNames(of: el).contains(kAXPressAction as String),
            AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
+            // 光标要跟到元素位置：AXPress 不经过事件系统，
+            // 若不主动移动，屏幕上看到的是「AI 说点了但光标没动」。
+            if let c = elementCenter(el) {
+                Overlay.cursorClick(x: c.x, y: c.y)
+            }
             waitForChange(pid: ref.pid)
             return [["type": "text", "text": "已对 \(ref.name) 的元素 [\(id)] 执行 AXPress"]]
         }
