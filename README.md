@@ -72,7 +72,8 @@ dsh plugin --profile web add file:/path/to/dsh-cua
 | 工具 | 作用 |
 |---|---|
 | `list_apps` | 列出运行中的图形应用 |
-| `get_app_state` | AX 树文本 + 截图；返回的 `[数字]` 供后续动作用 |
+| `screen_state` | 返回 `locked` / `unlocked` |
+| `get_app_state` | AX 树文本 + 截图；默认增量，`[数字]` 跨快照稳定 |
 | `click` | 点元素中心或屏幕坐标，支持双击、右键 |
 | `type_text` | Unicode 直接注入，不走剪贴板 |
 | `press_key` | 按键 / 组合键，`return`、`cmd+c`、`shift+tab` |
@@ -206,6 +207,26 @@ Codex 的对应实现是 `SyntheticAppFocusEnforcer`，它的 State 有三个独
 
 ---
 
+## 省 token 的两件事
+
+Codex 让长会话不炸上下文的两个设计，这里都补齐了。
+
+**增量输出。** 元素 ID 按结构路径跨快照复用（`AXWindow[0]/AXGroup[1]/AXButton[2]`），
+同一个控件每次拿到同一个编号。`get_app_state` 默认 `diff=auto`：有基线时只返回
+变化的节点，未变的沿用上轮 ID。实测同一界面第二次取状态从 62562 字符降到 1295 字符。
+
+**截图去重。** 8×8 灰度平均哈希比对上一帧，画面没变就不重复附图——
+一张 1600px 的截图要占上千 token，长会话里「界面没动也重发」是主要浪费。
+`diff=none` 取全量，`screenshot=always` 强制附图。
+
+**元素失效重取。** 每个元素记一条结构路径指纹。AX 引用失效时按路径重新定位，
+role 对得上才认——路径相撞时宁可报错也不能点错控件。模型手里的 ID 跨多次界面
+变化仍然可用，不必每步重取整棵树。自检里 60 个采样元素路径解析 60/60 命中。
+
+**锁屏。** 锁屏时 AX 读取、截屏、事件注入全部被系统挡掉，逐个工具报错会让模型
+误判成「元素找不到」反复重试。现在统一拦在前面返回原因，另有 `screen_state`
+工具直接查状态。
+
 ## 实时画面
 
 AI 在后台操作时，对话页右上角会出现一个小窗，实时显示它正在点哪个窗口。
@@ -234,12 +255,12 @@ AI 在后台操作时，对话页右上角会出现一个小窗，实时显示�
 
 | 能力 | Codex | dsh-cua |
 |---|---|---|
-| AX 树 diff | 三档 diff，省 token | 无，每次全量 |
-| 元素失效重取 | `RefetchableUIElement` + invalidation monitor | 无，快照语义 |
-| 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 无，按参数决定 |
+| AX 树 diff | 三档 diff，省 token | 已实现：`diff=auto` 只报变化节点 |
+| 元素失效重取 | `RefetchableUIElement` + invalidation monitor | 已实现：结构路径指纹自动找回 |
+| 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 已实现：8×8 指纹相同则不重复附图 |
 | 虚拟光标动画 | `ComputerUseCursor` + Lens 帧 | 无 |
 | 实时画面回显 | `RemoteHostedPIP*` 全套 | 已实现：对话页右上角 MJPEG 小窗 |
-| 锁屏处理 | Guardian + AuthorizationPlugin | 无，锁屏时工具会失败 |
+| 锁屏处理 | Guardian + AuthorizationPlugin | 部分：检测并给出明确原因，不解锁 |
 | 应用级策略 | 组织策略 + 内置黑名单 | 无 |
 | 审批弹窗 | `createElicitation` + 4 级确认策略 | 无，依赖 harness 自身审批 |
 | 私有截图路径 | `captureScreenshotWithSkyLight` | 无，只用公开 SCK |

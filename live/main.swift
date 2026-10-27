@@ -127,8 +127,8 @@ final class LiveState {
     private var sequence = 0
     private var capturing = false
 
-    func setTarget(pid: pid_t, appName: String, ttl: Double) {
-        guard let wid = windowID(for: pid) else { return }
+    func setTarget(pid: pid_t, appName: String, ttl: Double, explicit: CGWindowID?) {
+        guard let wid = explicit ?? windowID(for: pid) else { return }
         lock.lock()
         let changed = target?.pid != pid || target?.windowID != wid
         target = Target(
@@ -316,7 +316,8 @@ func handleConnection(_ conn: NWConnection) {
             let app = params["app"] ?? ""
             let ttl = Double(params["ttl"] ?? "") ?? 20
             if pid > 0 {
-                state.setTarget(pid: pid, appName: app, ttl: ttl)
+                let explicit = params["window"].flatMap { CGWindowID($0) }
+                state.setTarget(pid: pid, appName: app, ttl: ttl, explicit: explicit)
             }
             let t = state.activeTarget()
             conn.send(content: jsonResponse([

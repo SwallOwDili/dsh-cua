@@ -16,9 +16,29 @@ import UniformTypeIdentifiers
 // MARK: - 全局状态
 
 /// 最近一次 get_app_state 的元素登记表：pid → (elementID → AXUIElement)
-var registries: [pid_t: [Int: AXUIElement]] = [:]
-/// 每个 pid 的下一个可用 elementID（单调递增，跨快照不复用）
+/// 元素条目：除了 AX 引用，还带一条「结构路径」指纹。
+///
+/// AXUIElement 是运行期引用，界面一变就可能失效；而模型手里的 elementID
+/// 必须在多步操作中保持可用。路径指纹用来在失效后重新定位同一个控件：
+/// 形如 `AXWindow[0]/AXGroup[1]/AXButton[2]`，每段是 role 加同类兄弟序号。
+struct ElementEntry {
+    let element: AXUIElement
+    let path: String
+    let role: String
+    let title: String
+}
+
+var registries: [pid_t: [Int: ElementEntry]] = [:]
+/// 每个 pid 的下一个可用 elementID（单调递增，仅用于新出现的元素）
 var nextIDs: [pid_t: Int] = [:]
+/// path → id，用于跨快照复用 id：同一个控件在两次快照里拿到同一个编号
+var idByPath: [pid_t: [String: Int]] = [:]
+/// 上一次快照的 path → (id, 行内容)，增量输出据此只报变化
+struct BaselineEntry {
+    let id: Int
+    let line: String
+}
+var baselines: [pid_t: [String: BaselineEntry]] = [:]
 
 
 // MARK: - 运行时配置（热读）
@@ -225,12 +245,17 @@ func resolveApp(_ query: String) throws -> AppRef {
 // MARK: - AX 树遍历与渲染
 
 struct Snapshot {
-    let text: String
+    var text: String
     let count: Int
     let focused: String?
+    var unchanged = 0
+    var changed = 0
+    var added = 0
+    var removed = 0
+    var isDiff = false
 }
 
-func captureTree(pid: pid_t, appName: String) -> Snapshot {
+func captureTree(pid: pid_t, appName: String, useDiff: Bool = false) -> Snapshot {
     let root = AXUIElementCreateApplication(pid)
 
     // 真正的焦点元素：AXCell 等容器会把自己的 focused 报成 true，不可直接采信，
@@ -248,14 +273,19 @@ func captureTree(pid: pid_t, appName: String) -> Snapshot {
         start = w as! AXUIElement
     }
 
-    var registry: [Int: AXUIElement] = [:]
+    var registry: [Int: ElementEntry] = [:]
     var counter = nextIDs[pid] ?? 1
     var lines: [String] = []
+    var collected: [(path: String, id: Int, depth: Int, line: String)] = []
     var visited = 0
     var focusedLine: String?
 
-    struct Frame { let el: AXUIElement; let depth: Int }
-    var stack: [Frame] = [Frame(el: start, depth: 0)]
+    // 跨快照复用 id：同一个结构路径拿同一个编号，模型可以继续用旧 id。
+    let previousPaths = idByPath[pid] ?? [:]
+    var pathsInUse: [String: Int] = [:]
+
+    struct Frame { let el: AXUIElement; let depth: Int; let path: String; let roleIndex: Int }
+    var stack: [Frame] = [Frame(el: start, depth: 0, path: "", roleIndex: 0)]
 
     while let f = stack.popLast() {
         let cap = CuaConfig.current().maxElements
@@ -263,11 +293,22 @@ func captureTree(pid: pid_t, appName: String) -> Snapshot {
         if f.depth > maxDepth { continue }
         visited += 1
 
-        let id = counter
-        counter += 1
-        registry[id] = f.el
-
         let role = strAttr(f.el, kAXRoleAttribute as String) ?? "AXUnknown"
+        let title = strAttr(f.el, kAXTitleAttribute as String) ?? ""
+
+        // 路径 = 父路径 + role + 同 role 兄弟序号。序号由父节点的入栈时算好，
+        // 比 AX 的原始下标稳定：兄弟里插进别的 role 不会让整条路径错位。
+        let path = f.path + "/" + role + "[" + String(f.roleIndex) + "]"
+
+        let id: Int
+        if let reuse = previousPaths[path] ?? pathsInUse[path] {
+            id = reuse
+        } else {
+            id = counter
+            counter += 1
+        }
+        pathsInUse[path] = id
+        registry[id] = ElementEntry(element: f.el, path: path, role: role, title: title)
         var parts: [String] = ["[\(id)]", role]
 
         if let sub = strAttr(f.el, kAXSubroleAttribute as String), !sub.isEmpty, sub != role {
@@ -301,31 +342,242 @@ func captureTree(pid: pid_t, appName: String) -> Snapshot {
 
         let line = String(repeating: indentUnit, count: f.depth) + parts.joined(separator: " ")
         lines.append(line)
+        collected.append((path: path, id: id, depth: f.depth, line: line))
         if isFocused, focusedLine == nil {
             focusedLine = line.trimmingCharacters(in: .whitespaces)
         }
 
         let kids = childrenOf(f.el)
-        for k in kids.reversed() {
-            stack.append(Frame(el: k, depth: f.depth + 1))
+        var roleCount: [String: Int] = [:]
+        var childFrames: [Frame] = []
+        childFrames.reserveCapacity(kids.count)
+        for k in kids {
+            let kr = strAttr(k, kAXRoleAttribute as String) ?? "AXUnknown"
+            let idx = roleCount[kr] ?? 0
+            roleCount[kr] = idx + 1
+            childFrames.append(Frame(el: k, depth: f.depth + 1, path: path, roleIndex: idx))
+        }
+        for cf in childFrames.reversed() {
+            stack.append(cf)
         }
     }
 
     registries[pid] = registry
     nextIDs[pid] = counter
+    idByPath[pid] = pathsInUse
+
+    // 增量输出：与上一版基线逐 path 比对。
+    // 未变化的节点不重复吐——id 已经稳定，模型手上还有上一轮那个编号。
+    let previous = baselines[pid] ?? [:]
+    var fresh: [String: BaselineEntry] = [:]
+    fresh.reserveCapacity(collected.count)
+    for item in collected {
+        // 缩进后的整行（含 id）用于展示；比对时剥掉 id，否则 id 复用也会被判成变化
+        let content = item.line.replacingOccurrences(
+            of: "[\(item.id)]",
+            with: "[]"
+        )
+        fresh[item.path] = BaselineEntry(id: item.id, line: content)
+    }
 
     var header = "App: \(appName) (pid \(pid))\n"
     if let fl = focusedLine { header += "Focused: \(fl)\n" }
     header += "Elements: \(registry.count)\n"
 
-    return Snapshot(text: header + lines.joined(separator: "\n"), count: registry.count, focused: focusedLine)
+    var snap = Snapshot(text: "", count: registry.count, focused: focusedLine)
+    snap.unchanged = 0
+    snap.changed = 0
+    snap.added = 0
+    snap.removed = 0
+    snap.isDiff = false
+
+    if useDiff, !previous.isEmpty {
+        var out: [String] = []
+        var seen: Set<String> = []
+        for item in collected {
+            seen.insert(item.path)
+            let content = fresh[item.path]!.line
+            guard let old = previous[item.path] else {
+                snap.added += 1
+                out.append(item.line + "   ← 新增")
+                continue
+            }
+            if old.line == content {
+                snap.unchanged += 1
+                continue
+            }
+            snap.changed += 1
+            // 只报真正变化的属性，避免整行重读
+            let delta = attributeDelta(from: old.line, to: item.line)
+            out.append(item.line + "   ← 变化: " + delta)
+        }
+        for (path, old) in previous where !seen.contains(path) {
+            snap.removed += 1
+            out.append("[已移除] path=\(path) 原为: " + old.line.trimmingCharacters(in: .whitespaces))
+        }
+
+        header += "Diff: 未变 \(snap.unchanged)，变化 \(snap.changed)，新增 \(snap.added)，移除 \(snap.removed)\n"
+        if out.isEmpty {
+            header += "（界面无变化）\n"
+        } else {
+            header += "只列变化节点；未变节点沿用上轮的 elementID。需要全量请用 diff=none。\n"
+        }
+        snap.text = header + out.joined(separator: "\n")
+        snap.isDiff = true
+    } else {
+        snap.text = header + lines.joined(separator: "\n")
+    }
+
+    baselines[pid] = fresh
+    return snap
+}
+
+/// 元素是否还能读属性。窗口关掉或视图重建后，AXUIElement 仍是个非空引用，
+/// 但任何属性读取都会失败——只能靠实际读一次来判断死活。
+func isAlive(_ el: AXUIElement) -> Bool {
+    var value: CFTypeRef?
+    let err = AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &value)
+    return err == .success && value != nil
+}
+
+/// 按结构路径重新定位元素：从应用根开始，逐段在子节点里找同 role 的第 N 个。
+/// 这是失效重取的核心——模型手里的 elementID 跨越多次界面变化仍然可用。
+func resolvePath(pid: pid_t, path: String) -> AXUIElement? {
+    let root = AXUIElementCreateApplication(pid)
+    var current: AXUIElement = root
+    if let w = attr(root, kAXMainWindowAttribute as String),
+       CFGetTypeID(w) == AXUIElementGetTypeID() {
+        current = w as! AXUIElement
+    }
+    // 第一段对应根元素自身，跳过
+    let segments = path.split(separator: "/").dropFirst()
+    if segments.isEmpty { return current }
+
+    for segment in segments {
+        guard let open = segment.lastIndex(of: "["),
+              let close = segment.lastIndex(of: "]"),
+              close > open,
+              let index = Int(segment[segment.index(after: open)..<close]) else { return nil }
+        let role = String(segment[segment.startIndex..<open])
+        var matched = 0
+        var found: AXUIElement?
+        for kid in childrenOf(current) {
+            let kr = strAttr(kid, kAXRoleAttribute as String) ?? "AXUnknown"
+            guard kr == role else { continue }
+            if matched == index { found = kid; break }
+            matched += 1
+        }
+        guard let next = found else { return nil }
+        current = next
+    }
+    return current
+}
+
+
+/// 比较两行节点描述，列出真正变化的属性片段。
+/// 逐空格切分后按 "key" 对齐，避免整行重读浪费 token。
+func attributeDelta(from old: String, to new: String) -> String {
+    let strip: (String) -> [String] = { line in
+        line.trimmingCharacters(in: .whitespaces)
+            .split(separator: " ")
+            .map(String.init)
+            .filter { !$0.hasPrefix("[") && !$0.isEmpty }
+    }
+    let a = strip(old), b = strip(new)
+    if a == b { return "位置/层级调整" }
+    let setA = Set(a), setB = Set(b)
+    let gone = a.filter { !setB.contains($0) && $0 != "←" }
+    let came = b.filter { !setA.contains($0) && $0 != "←" }
+    var parts: [String] = []
+    if !gone.isEmpty { parts.append("去掉 " + gone.prefix(3).joined(separator: " ")) }
+    if !came.isEmpty { parts.append("改为 " + came.prefix(3).joined(separator: " ")) }
+    return parts.isEmpty ? "属性顺序变化" : parts.joined(separator: " / ")
+}
+
+
+/// AX 元素所属窗口的 CGWindowID。
+/// _AXUIElementGetWindow 是私有符号，但十几年未变，比「按 pid 猜面积最大的窗口」
+/// 准确得多：同一个 app 开多个窗口时，猜法会把小窗指到主窗口上。
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+/// 向上找 AXWindow 祖先并取它的窗口号。最多走 12 层，防止异常深的树拖时间。
+func containingWindow(of el: AXUIElement) -> CGWindowID? {
+    var cur = el
+    for _ in 0..<12 {
+        if let role = strAttr(cur, kAXRoleAttribute as String), role == "AXWindow" {
+            var wid: CGWindowID = 0
+            if _AXUIElementGetWindow(cur, &wid) == .success, wid != 0 {
+                return wid
+            }
+            return nil
+        }
+        guard let p = attr(cur, kAXParentAttribute as String),
+              CFGetTypeID(p) == AXUIElementGetTypeID() else { return nil }
+        cur = p as! AXUIElement
+    }
+    return nil
 }
 
 func element(pid: pid_t, id: Int) throws -> AXUIElement {
-    guard let reg = registries[pid], let el = reg[id] else {
+    guard let reg = registries[pid], let entry = reg[id] else {
         throw CUAError.staleElement("元素 [\(id)] 不在当前快照中，先调用 get_app_state 刷新")
     }
-    return el
+    if isAlive(entry.element) {
+        return entry.element
+    }
+    // 引用失效：按指纹路径找回同一个控件，而不是逼模型重新取整棵树。
+    if let fresh = resolvePath(pid: pid, path: entry.path) {
+        let role = strAttr(fresh, kAXRoleAttribute as String) ?? entry.role
+        // 只有 role 对得上才认：路径相撞时宁可不认，也不能点错控件
+        if role == entry.role {
+            registries[pid]?[id] = ElementEntry(
+                element: fresh,
+                path: entry.path,
+                role: entry.role,
+                title: entry.title
+            )
+            return fresh
+        }
+    }
+    throw CUAError.staleElement(
+        "元素 [\(id)] \(entry.role) \(entry.title) 已从界面消失，重取失败；请重新调用 get_app_state"
+    )
+}
+
+
+// MARK: - 截图指纹
+//
+// 目的不是识别内容，而是判断「这一帧和上一帧是不是同一画面」。
+// 8x8 灰度平均哈希足够：界面没动时哈希完全一致，动了必然不同。
+// 用 JPEG 字节哈希会更敏感——同一画面重新编码也可能因量化差异变字节。
+
+var lastShotHash: [pid_t: UInt64] = [:]
+
+func imageFingerprint(_ img: CGImage) -> UInt64 {
+    let w = 8, h = 8
+    var buf = [UInt8](repeating: 0, count: w * h)
+    let ok = buf.withUnsafeMutableBytes { raw -> Bool in
+        guard let ctx = CGContext(
+            data: raw.baseAddress,
+            width: w, height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: w,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return false }
+        ctx.interpolationQuality = .low
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return true
+    }
+    guard ok else { return 0 }
+    let total = buf.reduce(UInt64(0)) { $0 + UInt64($1) }
+    let mean = total / UInt64(buf.count)
+    var hash: UInt64 = 0
+    for (i, v) in buf.enumerated() where UInt64(v) >= mean {
+        hash |= (UInt64(1) << UInt64(i))
+    }
+    return hash
 }
 
 // MARK: - 截图
@@ -363,6 +615,43 @@ func captureWindowImage(pid: pid_t, windowID: CGWindowID, maxDim: Int, quality: 
     }
     _ = sem.wait(timeout: .now() + 30)
     if let d = out { return d }
+    throw CUAError.captureFailed(failure?.localizedDescription ?? "截图超时")
+}
+
+/// 截图并同时返回画面指纹，供调用方判断要不要真的把图发出去。
+func captureWindowFrame(pid: pid_t, windowID: CGWindowID, maxDim: Int, quality: Double) throws -> (data: Data, hash: UInt64) {
+    let sem = DispatchSemaphore(value: 0)
+    var out: (Data, UInt64)?
+    var failure: Error?
+
+    Task {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let win = content.windows.first(where: { $0.windowID == windowID }) else {
+                throw CUAError.captureFailed("找不到 windowID \(windowID)")
+            }
+            let filter = SCContentFilter(desktopIndependentWindow: win)
+            let cfg = SCStreamConfiguration()
+            let scale = CGFloat(filter.pointPixelScale)
+            let w = max(1, Int(filter.contentRect.width * scale))
+            let h = max(1, Int(filter.contentRect.height * scale))
+            let factor = min(1.0, Double(maxDim) / Double(max(w, h)))
+            cfg.width = max(1, Int(Double(w) * factor))
+            cfg.height = max(1, Int(Double(h) * factor))
+            cfg.showsCursor = false
+            cfg.capturesAudio = false
+            cfg.pixelFormat = kCVPixelFormatType_32BGRA
+            let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+            if let data = encodeJPEG(img, quality: quality) {
+                out = (data, imageFingerprint(img))
+            }
+        } catch {
+            failure = error
+        }
+        sem.signal()
+    }
+    _ = sem.wait(timeout: .now() + 30)
+    if let o = out { return o }
     throw CUAError.captureFailed(failure?.localizedDescription ?? "截图超时")
 }
 
@@ -504,8 +793,8 @@ enum Live {
     }
 
     /// 告知 cua-live 当前操作目标。fire-and-forget，不阻塞工具调用。
-    static func notify(pid: pid_t, appName: String, ttl: Double) {
-        let key = "\(pid)|\(appName)"
+    static func notify(pid: pid_t, appName: String, ttl: Double, windowID: CGWindowID? = nil) {
+        let key = "\(pid)|\(appName)|\(windowID.map(String.init) ?? "-")"
         let now = Date()
         if key == lastKey, now.timeIntervalSince(lastSentAt) < 2.0 { return }
         lastKey = key
@@ -514,8 +803,10 @@ enum Live {
         // 只用 urlQueryAllowed 会把 & 和 = 留在里面，应用名含这些字符时查询串会被截断
         var allowed = CharacterSet.urlQueryAllowed
         allowed.remove(charactersIn: "&=?+")
-        guard let encoded = appName.addingPercentEncoding(withAllowedCharacters: allowed),
-              let u = url("/target?pid=\(pid)&ttl=\(Int(ttl))&app=\(encoded)") else { return }
+        guard let encoded = appName.addingPercentEncoding(withAllowedCharacters: allowed) else { return }
+        var query = "/target?pid=\(pid)&ttl=\(Int(ttl))&app=\(encoded)"
+        if let w = windowID { query += "&window=\(w)" }
+        guard let u = url(query) else { return }
         // 同步等应答：cua-mcp 是一次性进程，fire-and-forget 的 task 会在退出时被丢弃，
         // 表现就是目标从未送达（2026-10-27 踩过）。这里 0.6 秒封顶，且已按 pid+app 节流。
         var req = URLRequest(url: u)
@@ -530,6 +821,7 @@ enum Overlay {
     static let socketPath = "/tmp/cua-overlay.sock"
     static var launched = false
     static var lastPID: pid_t = 0
+    static var lastWindow: CGWindowID = 0
     static var lastSentAt: Date = .distantPast
 
     static var binaryPath: String {
@@ -667,15 +959,17 @@ enum Overlay {
     }
 
     /// 标记某个 app 的窗口正在被操作；空闲 20s 后自动隐藏。
-    static func mark(pid: pid_t, appName: String) {
+    static func mark(pid: pid_t, appName: String, windowID explicitWindow: CGWindowID? = nil) {
         guard CuaConfig.current().overlayEnabled else { return }
         // overlay 指令是 socket 往返 + 一次 CGWindowList 全量遍历，
         // 单次约 5-15ms。同一个 app 连续操作时没必要重发。
         // 只在切换目标或距上次发送超过 2s 时才刷新（保证 ttl 续期）。
         let now = Date()
-        if lastPID == pid, now.timeIntervalSince(lastSentAt) < 2.0 { return }
-
-        guard let wid = windowID(for: pid) else { return }
+        guard let wid = explicitWindow ?? windowID(for: pid) else { return }
+        // 窗口号也参与节流判断：同一 app 换了窗口就得重新标记，
+        // 否则小窗会一直停在上一个窗口上。
+        if lastPID == pid, lastWindow == wid, now.timeIntervalSince(lastSentAt) < 2.0 { return }
+        lastWindow = wid
         lastPID = pid
         lastSentAt = now
 
@@ -690,7 +984,7 @@ enum Overlay {
             "ttl": ttl,
         ])
         // 同步把目标交给实时画面服务，对话页角标小窗据此出图
-        Live.notify(pid: pid, appName: appName, ttl: ttl)
+        Live.notify(pid: pid, appName: appName, ttl: ttl, windowID: wid)
     }
 
     static func hide() {
@@ -996,24 +1290,58 @@ func toolListApps(_ args: [String: Any]) throws -> [[String: Any]] {
     return [["type": "text", "text": "\(apps.count) 个应用：\n" + text]]
 }
 
+
+// MARK: - 锁屏
+
+/// 屏幕是否处于锁定状态。
+/// 锁屏时 AX 读取和 CGEvent 投递都会被系统挡掉，逐个工具报错会让模型误判成
+/// 「元素找不到」而反复重试；这里统一给出可读的原因。
+func isScreenLocked() -> Bool {
+    guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+    return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
+}
+
 func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let q = args["app"] as? String else { throw CUAError.badRequest("app 必填") }
     let ref = try resolveApp(q)
     Overlay.mark(pid: ref.pid, appName: ref.name)
-    let snap = captureTree(pid: ref.pid, appName: ref.name)
+
+    // diff 默认 auto：有基线就只报变化，没基线（首次）自动退化成全量
+    let diffMode = (args["diff"] as? String) ?? "auto"
+    let useDiff = diffMode != "none"
+    let snap = captureTree(pid: ref.pid, appName: ref.name, useDiff: useDiff)
 
     var content: [[String: Any]] = [["type": "text", "text": snap.text]]
 
-    let wantShot = (args["screenshot"] as? Bool) ?? true
+    // screenshot 默认 auto：画面与上次同尺寸且采样指纹一致就不附图。
+    // 图片按尺寸占 token，长会话里「界面没动也重发一张」是主要浪费。
+    let shotMode = (args["screenshot"] as? String) ?? "auto"
+    let wantShot: Bool
+    if shotMode == "true" || shotMode == "always" { wantShot = true }
+    else if shotMode == "false" || shotMode == "never" { wantShot = false }
+    else if let bool = args["screenshot"] as? Bool { wantShot = bool }
+    else { wantShot = true }
+
     if wantShot {
         let maxDim = (args["max_dimension"] as? Int) ?? 1600
         let quality = (args["quality"] as? Double) ?? 0.6
-        if let wid = windowID(for: ref.pid), let data = try? captureWindowImage(pid: ref.pid, windowID: wid, maxDim: maxDim, quality: quality) {
-            content.append([
-                "type": "image",
-                "data": data.base64EncodedString(),
-                "mimeType": "image/jpeg",
-            ])
+        if let wid = windowID(for: ref.pid),
+           let shot = try? captureWindowFrame(pid: ref.pid, windowID: wid, maxDim: maxDim, quality: quality) {
+            let previous = lastShotHash[ref.pid]
+            if shotMode == "auto", previous == shot.hash {
+                // 画面没变就不重复附图：一张 1600px 的图要占上千 token
+                content.append([
+                    "type": "text",
+                    "text": "[画面与上次一致，未重复附图；需要强制取图请传 screenshot=\"always\"]",
+                ])
+            } else {
+                lastShotHash[ref.pid] = shot.hash
+                content.append([
+                    "type": "image",
+                    "data": shot.data.base64EncodedString(),
+                    "mimeType": "image/jpeg",
+                ])
+            }
         } else {
             content.append(["type": "text", "text": "[截图不可用：未找到可见窗口]"])
         }
@@ -1281,6 +1609,11 @@ func toolClick(_ args: [String: Any]) throws -> [[String: Any]] {
     if let id = args["element_index"] as? Int {
         let el = try element(pid: ref.pid, id: id)
         _ = setAttr(el, kAXFocusedAttribute as String, kCFBooleanTrue)
+        // 元素属于哪个窗口就标记哪个：同一个 app 开多窗时，
+        // 按「面积最大的窗口」猜会把小窗指错地方。
+        if let w = containingWindow(of: el) {
+            Overlay.mark(pid: ref.pid, appName: ref.name, windowID: w)
+        }
         usleep(20_000)
     }
 
@@ -1466,11 +1799,16 @@ let appP: [String: Any] = ["type": "string", "description": "应用名、完整�
 let tools: [ToolDef] = [
     ToolDef(name: "list_apps", description: "列出当前运行的图形应用（名称、bundle id、pid）。",
             schema: obj([:], [])),
+    ToolDef(name: "screen_state", description: "返回 locked 或 unlocked。锁屏时其它工具都会失败。",
+            schema: obj([:], [])),
     ToolDef(name: "get_app_state",
-            description: "获取应用的辅助功能树文本，以及一张截图。返回的 [数字] 是元素 ID，供后续动作使用。",
+            description: "获取应用的辅助功能树文本，以及一张截图。返回的 [数字] 是元素 ID，供后续动作使用。元素 ID 跨快照稳定，界面变化后仍可沿用。",
             schema: obj([
                 "app": appP,
-                "screenshot": ["type": "boolean", "description": "是否附带截图，默认 true"],
+                "diff": ["type": "string", "enum": ["auto", "none"],
+                         "description": "auto（默认）：有基线时只返回变化的节点，未变的沿用上轮 ID；none：返回完整树"],
+                "screenshot": ["type": "string", "enum": ["auto", "always", "never"],
+                         "description": "auto（默认）：画面与上次一致时不重复附图；always/never 强制"],
                 "max_dimension": ["type": "integer", "description": "截图最长边像素，默认 1600"],
                 "quality": ["type": "number", "description": "JPEG 质量 0-1，默认 0.6"],
             ], ["app"])),
@@ -1556,9 +1894,17 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
             throw CUAError.badRequest("缺少工具名")
         }
         let args = (params["arguments"] as? [String: Any]) ?? [:]
+        // 锁屏时所有依赖 AX / 截屏 / 注入的工具都会失败，先给准确原因
+        if isScreenLocked(), name != "list_apps", name != "screen_state" {
+            throw CUAError.badRequest("屏幕已锁定（loginwindow 接管）。AX 读取、截屏与输入投递都不可用，请先解锁屏幕再重试。")
+        }
         let content: [[String: Any]]
         switch name {
         case "list_apps": content = try toolListApps(args)
+        case "screen_state": content = [[
+            "type": "text",
+            "text": isScreenLocked() ? "locked" : "unlocked",
+        ]]
         case "get_app_state": content = try toolGetAppState(args)
         case "click": content = try toolClick(args)
         case "type_text": content = try toolTypeText(args)
@@ -1613,6 +1959,23 @@ func selfTest() -> Int32 {
     if let first = apps.first {
         let snap = captureTree(pid: first.processIdentifier, appName: first.localizedName ?? "?")
         print("sample tree nodes:", snap.count)
+
+        // 路径指纹自检：用 path 重新解析，必须解回同一个 AX 元素。
+        // 重取逻辑全部依赖这一步，错了的话「元素失效自动找回」就是空话。
+        let reg = registries[first.processIdentifier] ?? [:]
+        var hit = 0, miss = 0
+        var samples: [(Int, ElementEntry)] = []
+        for (id, entry) in reg { samples.append((id, entry)) }
+        samples.sort { $0.0 < $1.0 }
+        for (_, entry) in samples.prefix(60) {
+            if let back = resolvePath(pid: first.processIdentifier, path: entry.path),
+               CFEqual(back, entry.element) {
+                hit += 1
+            } else {
+                miss += 1
+            }
+        }
+        print("path resolve: hit=\(hit) miss=\(miss)")
     }
 
     let cfg = CuaConfig.current()
