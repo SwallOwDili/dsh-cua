@@ -29,14 +29,22 @@ Elements: 122
 
 ## 安装
 
-仓库自带预编译二进制（arm64 + x86_64 通用），clone 下来就能用，不需要 Xcode。
+一条命令，不需要 clone，不需要 Xcode：
+
+```bash
+curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-1.12.8-macos-universal.tar.gz | tar xz
+```
+
+解压出 `dsh-cua/`，里面的 `bin/` 已经是 arm64 + x86_64 通用二进制。
+下面所有命令里的 `<解压目录>` 就指这个路径。
+
+也可以从源码拿：
 
 ```bash
 git clone https://github.com/SwallowDili/dsh-cua.git
 ```
 
-下面所有配置里的 `<仓库目录>` 都指你 clone 出来的这个路径，
-例如 `~/code/dsh-cua`。
+两种方式拿到的内容相同，仓库里同样带预编译二进制。
 
 需要 macOS 14+。
 
@@ -48,6 +56,8 @@ git clone https://github.com/SwallowDili/dsh-cua.git
 cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 ```
 
+换成 `<解压目录>` 同理。
+
 `<profile>` 是你的 profile 名（默认 `web`）。重启 dsh 后，
 工具会出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
 
@@ -56,7 +66,7 @@ cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 不用 dsh，任何 MCP 客户端直接指向二进制：
 
 ```bash
-<仓库目录>/bin/cua-mcp
+<解压目录>/bin/cua-mcp
 ```
 
 它是个 stdio 服务器，不需要额外的运行环境。
@@ -80,7 +90,7 @@ cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 
 ### 任意 MCP 客户端
 
-先拿到二进制的绝对路径（在 clone 出来的目录里执行）：
+先拿到二进制的绝对路径（在解压出来的目录里执行）：
 
 ```bash
 echo "$(pwd)/bin/cua-mcp"

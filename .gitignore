@@ -3,3 +3,4 @@ node_modules/
 *.arm64
 *.x64
 /tmp/
+dist/
