@@ -1,6 +1,6 @@
 {
   "name": "dsh-cua",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "macOS Computer Use for DeepSeek Harness — native AX tree, screenshot, and input injection as MCP tools",
   "type": "module",
   "main": "./index.js",

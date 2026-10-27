@@ -77,6 +77,13 @@ export const RuntimeSettings = Schema.object({
   maxElements: Schema.number()
     .default(4000)
     .description('AX 树单次快照的最大节点数。超出后截断，可调大以覆盖复杂界面。'),
+  syntheticActivate: Schema.boolean()
+    .default(true)
+    .description(
+      '合成激活：操作前把目标应用的 AXFrontmost 置位，让它「自认为」前台而系统前台不变，' +
+        '用户正在用的窗口不会被抢走。' +
+        '关闭后不主动激活，遇到不认事件的目标应用可能操作无效。',
+    ),
   deniedBundleIDs: Schema.array(Schema.string())
     .default([])
     .description('禁止操作的应用 bundleID 列表。命中即在分发层拒绝，动作不会落到目标应用。'),

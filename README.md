@@ -209,6 +209,23 @@ Codex 的对应实现是 `SyntheticAppFocusEnforcer`，它的 State 有三个独
 
 ---
 
+## 后台操作不抢焦点
+
+三层配合才做得到「AI 在后台干活，你继续用你的窗口」。
+
+**定向投递。** 点击与键入走 `CGEvent.postToPid`，事件直接进目标进程，不经过系统输入队列。
+
+**合成激活。** 目标若不认为自己在前台，把它的 `AXFrontmost` 置位。实测这个属性只改应用自己的认知，
+`NSWorkspace.frontmostApplication` 不变——正是 Codex `syntheticallyActivateIfNeeded` 的效果。
+窗口级 `AXMain`、应用级 `AXFocused` 都不碰，那些会真的把窗口升起。
+
+**元素点击优先 AXPress。** 鼠标事件即使定向投递到 pid，被点的应用也会当成真实点击、
+自己把窗口激活上来。AXPress 是纯 AX 动作，不经过事件系统。实测点 `AXMenuButton` 前后
+系统前台不变；而按坐标点击无法避免激活——那是真点击，属于 macOS 固有行为。
+
+滚动与拖拽是例外：Catalyst 应用吞掉定向投递的手势序列，只能走真实 HID 事件，
+所以会先激活目标并移动真实光标。这两个动作天然要占前台。
+
 ## 省 token 与稳定性
 
 Codex 让长会话不炸上下文的几个设计，这里逐条对齐。
@@ -290,6 +307,7 @@ EOF
 | 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 部分：纯色/微小变化/无变化三种判据 |
 | 虚拟光标动画 | `ComputerUseCursor` + Lens 帧 | 已实现：移动光环 + 点击涟漪（现画，非帧序列）|
 | 实时画面回显 | `RemoteHostedPIP*` 全套 | 已实现：对话页右上角 MJPEG 小窗 |
+| 后台输入 | `postToPid` + `syntheticallyActivateIfNeeded` | 已实现：`AXFrontmost` 合成激活，元素点击优先 `AXPress` |
 | 锁屏处理 | Guardian + AuthorizationPlugin | 已实现：检测 + 唤醒 + 可选密码解锁 |
 | 应用级策略 | 组织策略 + 内置黑名单 | 已实现：白/黑名单按 bundleID 拦在分发层 |
 | 审批弹窗 | `createElicitation` + 4 级确认策略 | 无，依赖 harness 自身审批 |
@@ -329,6 +347,7 @@ toolCallTimeoutMs: 180000     # 单次调用超时，截图慢时可加
 | `backgroundSilence` | `true` | 用 `postToPid` 定向投递，不抢焦点；关掉改用真实 HID |
 | `scrollStepPx` | `40` | 滚动单步像素；过大时 Catalyst 应用会丢事件 |
 | `maxElements` | `4000` | 单次快照的节点上限，超出截断 |
+| `syntheticActivate` | `true` | 操作前让目标「自认为」前台，但不抢走用户窗口 |
 | `deniedBundleIDs` | `[]` | 禁止操作的应用；命中即在分发层拒绝 |
 | `allowedBundleIDs` | `[]` | 只允许操作的应用；非空时其余一律拒绝，优先级高于禁止列表 |
 

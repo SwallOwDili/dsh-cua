@@ -67,6 +67,12 @@ window.__ModuleLoader__.load({
         hint: '界面复杂时快照会被截断，可调大。',
       },
       {
+        field: 'syntheticActivate',
+        kind: 'boolean',
+        label: '合成激活目标应用',
+        hint: '操作前让目标应用「自认为」前台，但不抢走你正在用的窗口。',
+      },
+      {
         field: 'deniedBundleIDs',
         kind: 'list',
         label: '禁止操作的应用',

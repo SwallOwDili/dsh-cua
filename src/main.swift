@@ -43,6 +43,48 @@ var baselines: [pid_t: [String: BaselineEntry]] = [:]
 /// 对应 Codex 的 "cumulative diff from the initial accessibility tree"。
 var initialBaselines: [pid_t: [String: BaselineEntry]] = [:]
 
+/// 元素失效监听。对应 Codex 的 UIElementTreeInvalidationMonitor。
+///
+/// 与 Codex 的差异要说清：它用监听做到「动作执行前校验目标仍有效」，
+/// 我这边 `element()` 本来就是每次读一次 role 判断死活，
+/// 所以监听在当前实现里的实际收益是**让 CGWindowID 缓存立即失效**——
+/// 窗口开关之后不会再拿旧窗口号去截图。监听本身不需要它也能正确工作。
+var invalidationCount: [pid_t: Int] = [:]
+var axObservers: [pid_t: AXObserver] = [:]
+
+let invalidationCallback: AXObserverCallback = { _, _, _, refcon in
+    guard let refcon else { return }
+    let pid = pid_t(Int(bitPattern: refcon))
+    invalidationCount[pid, default: 0] += 1
+    // 窗口结构变了，缓存的 CGWindowID 可能指向已经消失的窗口——
+    // 直接清掉，下次按需重取，避免截图截到错窗口。
+    windowIDCache.removeValue(forKey: pid)
+}
+
+func installInvalidationMonitor(pid: pid_t) {
+    guard axObservers[pid] == nil else { return }
+    var observer: AXObserver?
+    guard AXObserverCreate(pid, invalidationCallback, &observer) == .success,
+          let obs = observer else { return }
+    let app = AXUIElementCreateApplication(pid)
+    let refcon = UnsafeMutableRawPointer(bitPattern: Int(pid))
+    for note in [
+        kAXUIElementDestroyedNotification,
+        kAXWindowCreatedNotification,
+        kAXFocusedWindowChangedNotification,
+        kAXLayoutChangedNotification,
+    ] {
+        _ = AXObserverAddNotification(obs, app, note as CFString, refcon)
+    }
+    CFRunLoopAddSource(
+        CFRunLoopGetMain(),
+        AXObserverGetRunLoopSource(obs),
+        .defaultMode
+    )
+    axObservers[pid] = obs
+}
+
+
 
 // MARK: - 运行时配置（热读）
 //
@@ -78,6 +120,7 @@ struct RuntimeConfig: Decodable {
     var backgroundSilence: Bool = true
     var scrollStepPx: Int = 40
     var maxElements: Int = 4000
+    var syntheticActivate: Bool = true
     var deniedBundleIDs: [String] = []
     var allowedBundleIDs: [String] = []
 
@@ -87,7 +130,7 @@ struct RuntimeConfig: Decodable {
     enum CodingKeys: String, CodingKey {
         case browserCdpPort, browserCdpHost, overlayEnabled, overlayTtlSeconds
         case backgroundSilence, scrollStepPx, maxElements
-        case deniedBundleIDs, allowedBundleIDs
+        case syntheticActivate, deniedBundleIDs, allowedBundleIDs
     }
 
     init() {}
@@ -101,6 +144,7 @@ struct RuntimeConfig: Decodable {
         backgroundSilence = (try? c.decodeIfPresent(Bool.self, forKey: .backgroundSilence)).flatMap { $0 } ?? true
         scrollStepPx = (try? c.decodeIfPresent(Int.self, forKey: .scrollStepPx)).flatMap { $0 } ?? 40
         maxElements = (try? c.decodeIfPresent(Int.self, forKey: .maxElements)).flatMap { $0 } ?? 4000
+        syntheticActivate = (try? c.decodeIfPresent(Bool.self, forKey: .syntheticActivate)).flatMap { $0 } ?? true
         deniedBundleIDs = (try? c.decodeIfPresent([String].self, forKey: .deniedBundleIDs)).flatMap { $0 } ?? []
         allowedBundleIDs = (try? c.decodeIfPresent([String].self, forKey: .allowedBundleIDs)).flatMap { $0 } ?? []
     }
@@ -177,7 +221,7 @@ func sizeAttr(_ el: AXUIElement, _ name: String) -> CGSize? {
     return s
 }
 
-func actionsOf(_ el: AXUIElement) -> [String] {
+func actionNames(of el: AXUIElement) -> [String] {
     var names: CFArray?
     guard AXUIElementCopyActionNames(el, &names) == .success else { return [] }
     return names as? [String] ?? []
@@ -284,6 +328,7 @@ struct Snapshot {
 }
 
 func captureTree(pid: pid_t, appName: String, diffMode: String = "none") -> Snapshot {
+    installInvalidationMonitor(pid: pid)
     let root = AXUIElementCreateApplication(pid)
 
     // 真正的焦点元素：AXCell 等容器会把自己的 focused 报成 true，不可直接采信，
@@ -360,7 +405,7 @@ func captureTree(pid: pid_t, appName: String, diffMode: String = "none") -> Snap
         if isFocused { parts.append("(focused)") }
         if boolAttr(f.el, kAXSelectedAttribute as String) == true { parts.append("(selected)") }
 
-        let acts = actionsOf(f.el)
+        let acts = actionNames(of: f.el)
         if !acts.isEmpty {
             let interesting = acts.filter { $0 != kAXPressAction as String || acts.count > 1 }
             if !interesting.isEmpty {
@@ -1197,16 +1242,19 @@ func elementCenter(_ el: AXUIElement) -> CGPoint? {
 func synthesizeActivation(pid: pid_t) {
     let appEl = AXUIElementCreateApplication(pid)
 
-    // 主窗口标记为主窗口
+    // 主窗口标记为主窗口。窗口级 AXMain 只是让窗口自认为主窗口，
+    // 不会把它提到用户面前。
     if let w = attr(appEl, kAXMainWindowAttribute as String),
        CFGetTypeID(w) == AXUIElementGetTypeID() {
         let win = w as! AXUIElement
         _ = setAttr(win, kAXMainAttribute as String, kCFBooleanTrue)
-        _ = setAttr(win, kAXFocusedAttribute as String, kCFBooleanTrue)
     }
 
-    // 应用级焦点标记
-    _ = setAttr(appEl, kAXFocusedAttribute as String, kCFBooleanTrue)
+    // 关键：只置应用级 AXFrontmost，不置应用级 AXFocused。
+    // AXFocused 会真的把应用激活、窗口升起，把用户的焦点抢走；
+    // AXFrontmost 让应用「自认为」前台而系统前台不变（2026-10-27 实测）。
+    // 这正是 Codex syntheticallyActivateIfNeeded 的效果。
+    _ = syntheticallyActivate(pid: pid)
     usleep(30_000)
 }
 
@@ -1478,6 +1526,45 @@ func toolUnlockScreen(_ args: [String: Any]) throws -> [[String: Any]] {
         return [["type": "text", "text": "已尝试注入密码但屏幕仍处于锁定状态。请确认密码是否正确，或手动解锁。"]]
     }
     return [["type": "text", "text": "屏幕已解锁"]]
+}
+
+
+// MARK: - 合成激活
+//
+// Codex 的 syntheticallyActivateIfNeeded：让目标应用「自认为」在前台，
+// 从而接受定向事件，但不把它的窗口提到用户面前。
+//
+// 实测（2026-10-27）：对应用元素设置 AXFrontmost=true 之后，
+// 该应用的 AXFrontmost 读回 true，而 NSWorkspace.frontmostApplication
+// 仍是原来的应用——正是需要的行为。用公开 AX API，无需私有符号。
+
+func appIsFrontmost(pid: pid_t) -> Bool {
+    let app = AXUIElementCreateApplication(pid)
+    return boolAttr(app, kAXFrontmostAttribute as String) == true
+}
+
+/// 让目标自认为前台。返回是否达成。
+func syntheticallyActivate(pid: pid_t, timeout: TimeInterval = 0.5) -> Bool {
+    let app = AXUIElementCreateApplication(pid)
+    if boolAttr(app, kAXFrontmostAttribute as String) == true { return true }
+    let err = AXUIElementSetAttributeValue(
+        app, kAXFrontmostAttribute as CFString, kCFBooleanTrue
+    )
+    guard err == .success else { return false }
+    // Codex 的 waitUntilAppBelievesItIsFrontmost：置位不保证立刻生效，轮询确认
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if boolAttr(app, kAXFrontmostAttribute as String) == true { return true }
+        usleep(20_000)
+    }
+    return false
+}
+
+/// 动作前的统一前置：按配置决定是否合成激活。
+func prepareTarget(pid: pid_t) {
+    guard CuaConfig.current().syntheticActivate else { return }
+    guard !appIsFrontmost(pid: pid) else { return }
+    _ = syntheticallyActivate(pid: pid)
 }
 
 func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
@@ -1807,14 +1894,24 @@ func toolClick(_ args: [String: Any]) throws -> [[String: Any]] {
 
     let count = (args["click_count"] as? Int) ?? 1
 
+    // 目标若不认为自己在前台，先合成激活（不抢用户焦点）
+    prepareTarget(pid: ref.pid)
+
     // 若按元素点击，先让该元素成为 AXFocused —— 后台场景下这是让应用接受输入的关键。
     if let id = args["element_index"] as? Int {
         let el = try element(pid: ref.pid, id: id)
-        _ = setAttr(el, kAXFocusedAttribute as String, kCFBooleanTrue)
         // 元素属于哪个窗口就标记哪个：同一个 app 开多窗时，
         // 按「面积最大的窗口」猜会把小窗指错地方。
         if let w = containingWindow(of: el) {
             Overlay.mark(pid: ref.pid, appName: ref.name, windowID: w)
+        }
+        // 优先走 AXPress：鼠标事件即使定向投递到 pid，被点的应用也会
+        // 当成真实点击、自己把窗口激活上来，用户焦点照样被抢。
+        // AXPress 是纯 AX 动作，不经过事件系统，窗口不会被升起。
+        if actionNames(of: el).contains(kAXPressAction as String),
+           AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
+            waitForChange(pid: ref.pid)
+            return [["type": "text", "text": "已对 \(ref.name) 的元素 [\(id)] 执行 AXPress"]]
         }
         usleep(20_000)
     }
@@ -1831,6 +1928,7 @@ func toolTypeText(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let text = args["text"] as? String else { throw CUAError.badRequest("text 必填") }
     let ref = try resolveApp(q)
     Overlay.mark(pid: ref.pid, appName: ref.name)
+    prepareTarget(pid: ref.pid)
     try typeText(pid: ref.pid, text: text)
     waitForChange(pid: ref.pid)
     return [["type": "text", "text": "已向 \(ref.name) 输入 \(text.count) 个字符"]]
@@ -1841,6 +1939,7 @@ func toolPressKey(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let key = args["key"] as? String else { throw CUAError.badRequest("key 必填") }
     let ref = try resolveApp(q)
     Overlay.mark(pid: ref.pid, appName: ref.name)
+    prepareTarget(pid: ref.pid)
     try postKey(pid: ref.pid, key: key)
     waitForChange(pid: ref.pid)
     return [["type": "text", "text": "已向 \(ref.name) 发送按键 \(key)"]]
@@ -1918,7 +2017,7 @@ func toolSecondaryAction(_ args: [String: Any]) throws -> [[String: Any]] {
     Overlay.mark(pid: ref.pid, appName: ref.name)
     let el = try element(pid: ref.pid, id: id)
 
-    let available = actionsOf(el)
+    let available = actionNames(of: el)
     guard available.contains(action) else {
         throw CUAError.badRequest("元素 [\(id)] 不支持 \(action)；可用: \(available.joined(separator: ", "))")
     }
@@ -2218,18 +2317,26 @@ if !CGPreflightScreenCaptureAccess() {
         "警告: 当前进程未获得屏幕录制授权，截图会失败。\n".data(using: .utf8)!)
 }
 
-while let line = readLine(strippingNewline: true) {
-    if line.isEmpty { continue }
+// MARK: - 事件循环
+//
+// 原来用 `while let line = readLine()` 阻塞读 stdin。那样主线程永远卡在 read 上，
+// AXObserver 的通知（需要 RunLoop 送达）永远收不到。
+// 改成 DispatchSourceRead 监听 fd 0、主线程跑 RunLoop：
+// 既能处理请求，又能接收元素销毁/窗口变化通知。
+
+/// 把一行 JSON-RPC 处理完。所有 AX/AppKit 操作都在主线程，避免线程问题。
+func handleLine(_ line: String) {
+    if line.isEmpty { return }
     guard let data = line.data(using: .utf8),
           let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         send(errorResponse(nil, -32700, "JSON 解析失败"))
-        continue
+        return
     }
 
     let id = msg["id"]
     guard let method = msg["method"] as? String else {
         if id != nil { send(errorResponse(id, -32600, "缺少 method")) }
-        continue
+        return
     }
     let params = (msg["params"] as? [String: Any]) ?? [:]
 
@@ -2252,3 +2359,26 @@ while let line = readLine(strippingNewline: true) {
         }
     }
 }
+
+var stdinBuffer = Data()
+
+let stdinSource = DispatchSource.makeReadSource(fileDescriptor: 0, queue: .main)
+stdinSource.setEventHandler {
+    var chunk = [UInt8](repeating: 0, count: 65536)
+    let n = read(0, &chunk, chunk.count)
+    guard n > 0 else {
+        // stdin 关闭：父进程走了，正常收尾
+        stdinSource.cancel()
+        exit(0)
+    }
+    stdinBuffer.append(contentsOf: chunk[0..<n])
+    while let nl = stdinBuffer.firstIndex(of: 0x0A) {
+        let lineData = stdinBuffer[stdinBuffer.startIndex..<nl]
+        stdinBuffer.removeSubrange(stdinBuffer.startIndex...nl)
+        guard let text = String(data: lineData, encoding: .utf8) else { continue }
+        handleLine(text)
+    }
+}
+stdinSource.resume()
+
+RunLoop.main.run()
