@@ -50,16 +50,25 @@ git clone https://github.com/SwallowDili/dsh-cua.git
 
 ### 作为 dsh 插件
 
-把仓库放进 dsh 的 profile 目录：
+必须放进 dsh profile 的 `node_modules` 下：
 
 ```bash
 cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 ```
 
-换成 `<解压目录>` 同理。
+`<profile>` 是你的 profile 名（默认 `web`）。
 
-`<profile>` 是你的 profile 名（默认 `web`）。重启 dsh 后，
-工具会出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
+**位置不能换。** 插件的 Node 部分依赖 `@deepseek-ai/schemastery`
+（由 dsh 自身提供，包里不带），只有放在 profile 的 `node_modules` 下才解析得到。
+放到别处会在加载时报：
+
+```
+ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/schemastery'
+```
+
+重启 dsh 后，工具会出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
+
+独立 MCP 模式没有这个限制，二进制不依赖任何 Node 包。
 
 ### 作为独立 MCP 服务器
 

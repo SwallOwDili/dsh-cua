@@ -64,5 +64,17 @@
     "cua-mcp": "./bin/cua-mcp",
     "cua-live": "./bin/cua-live",
     "cua-overlay": "./bin/cua-overlay"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "react": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
   }
 }
