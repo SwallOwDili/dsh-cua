@@ -77,6 +77,12 @@ export const RuntimeSettings = Schema.object({
   maxElements: Schema.number()
     .default(4000)
     .description('AX 树单次快照的最大节点数。超出后截断，可调大以覆盖复杂界面。'),
+  deniedBundleIDs: Schema.array(Schema.string())
+    .default([])
+    .description('禁止操作的应用 bundleID 列表。命中即在分发层拒绝，动作不会落到目标应用。'),
+  allowedBundleIDs: Schema.array(Schema.string())
+    .default([])
+    .description('只允许操作的应用 bundleID 列表。非空时其余应用一律拒绝，优先级高于禁止列表。'),
 })
 
 function resolveBinary(config) {

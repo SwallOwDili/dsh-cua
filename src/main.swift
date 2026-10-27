@@ -50,6 +50,26 @@ var initialBaselines: [pid_t: [String: BaselineEntry]] = [:]
 // 这里按 mtime 热读：设置页改完立即生效，不需要重启 harness。
 // 文件不存在时全部走默认值，与 schema 的 default 保持一致。
 
+
+// MARK: - 应用策略
+//
+// Codex 那套是 MDM 下发的组织策略；本机场景只需要一张表：
+// 白名单（只允许这些）优先于黑名单（禁止这些），都按 bundleID 精确匹配。
+// 命中就在工具分发层拒绝，不让动作落到目标应用上。
+
+func policyDecision(for app: AppRef) -> String? {
+    let cfg = CuaConfig.current()
+    let blocked = cfg.deniedBundleIDs
+    let allowed = cfg.allowedBundleIDs
+    if !allowed.isEmpty, !allowed.contains(app.bundleID) {
+        return "\(app.name)（\(app.bundleID)）不在允许列表内；当前只允许: " + allowed.joined(separator: ", ")
+    }
+    if blocked.contains(app.bundleID) {
+        return "\(app.name)（\(app.bundleID)）在禁止列表内，操作被拒绝"
+    }
+    return nil
+}
+
 struct RuntimeConfig: Decodable {
     var browserCdpPort: Int = 0
     var browserCdpHost: String = "127.0.0.1"
@@ -58,6 +78,8 @@ struct RuntimeConfig: Decodable {
     var backgroundSilence: Bool = true
     var scrollStepPx: Int = 40
     var maxElements: Int = 4000
+    var deniedBundleIDs: [String] = []
+    var allowedBundleIDs: [String] = []
 
     // 合成 Decodable 对缺失字段会抛错（属性默认值不参与），
     // 而配置文件允许只写部分键，所以逐字段 decodeIfPresent。
@@ -65,6 +87,7 @@ struct RuntimeConfig: Decodable {
     enum CodingKeys: String, CodingKey {
         case browserCdpPort, browserCdpHost, overlayEnabled, overlayTtlSeconds
         case backgroundSilence, scrollStepPx, maxElements
+        case deniedBundleIDs, allowedBundleIDs
     }
 
     init() {}
@@ -78,6 +101,8 @@ struct RuntimeConfig: Decodable {
         backgroundSilence = (try? c.decodeIfPresent(Bool.self, forKey: .backgroundSilence)).flatMap { $0 } ?? true
         scrollStepPx = (try? c.decodeIfPresent(Int.self, forKey: .scrollStepPx)).flatMap { $0 } ?? 40
         maxElements = (try? c.decodeIfPresent(Int.self, forKey: .maxElements)).flatMap { $0 } ?? 4000
+        deniedBundleIDs = (try? c.decodeIfPresent([String].self, forKey: .deniedBundleIDs)).flatMap { $0 } ?? []
+        allowedBundleIDs = (try? c.decodeIfPresent([String].self, forKey: .allowedBundleIDs)).flatMap { $0 } ?? []
     }
 }
 
@@ -610,9 +635,15 @@ func element(pid: pid_t, id: Int) throws -> AXUIElement {
 // 8x8 灰度平均哈希足够：界面没动时哈希完全一致，动了必然不同。
 // 用 JPEG 字节哈希会更敏感——同一画面重新编码也可能因量化差异变字节。
 
-var lastShotHash: [pid_t: UInt64] = [:]
+var lastShot: [pid_t: FrameSignature] = [:]
 
-func imageFingerprint(_ img: CGImage) -> UInt64 {
+struct FrameSignature {
+    let hash: UInt64
+    /// 8×8 灰度的标准差。纯色画面接近 0，正常界面在几十。
+    let spread: Double
+}
+
+func imageFingerprint(_ img: CGImage) -> FrameSignature {
     let w = 8, h = 8
     var buf = [UInt8](repeating: 0, count: w * h)
     let ok = buf.withUnsafeMutableBytes { raw -> Bool in
@@ -628,14 +659,23 @@ func imageFingerprint(_ img: CGImage) -> UInt64 {
         ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
         return true
     }
-    guard ok else { return 0 }
+    guard ok else { return FrameSignature(hash: 0, spread: 0) }
     let total = buf.reduce(UInt64(0)) { $0 + UInt64($1) }
-    let mean = total / UInt64(buf.count)
+    let mean = Double(total) / Double(buf.count)
     var hash: UInt64 = 0
-    for (i, v) in buf.enumerated() where UInt64(v) >= mean {
+    for (i, v) in buf.enumerated() where Double(v) >= mean {
         hash |= (UInt64(1) << UInt64(i))
     }
-    return hash
+    var acc = 0.0
+    for v in buf {
+        let d = Double(v) - mean
+        acc += d * d
+    }
+    return FrameSignature(hash: hash, spread: (acc / Double(buf.count)).squareRoot())
+}
+
+func hamming(_ a: UInt64, _ b: UInt64) -> Int {
+    (a ^ b).nonzeroBitCount
 }
 
 // MARK: - 截图
@@ -677,9 +717,9 @@ func captureWindowImage(pid: pid_t, windowID: CGWindowID, maxDim: Int, quality: 
 }
 
 /// 截图并同时返回画面指纹，供调用方判断要不要真的把图发出去。
-func captureWindowFrame(pid: pid_t, windowID: CGWindowID, maxDim: Int, quality: Double) throws -> (data: Data, hash: UInt64) {
+func captureWindowFrame(pid: pid_t, windowID: CGWindowID, maxDim: Int, quality: Double) throws -> (data: Data, sig: FrameSignature) {
     let sem = DispatchSemaphore(value: 0)
-    var out: (Data, UInt64)?
+    var out: (Data, FrameSignature)?
     var failure: Error?
 
     Task {
@@ -1373,6 +1413,73 @@ func appInstruction(bundleID: String) -> String? {
     return trimmed.isEmpty ? nil : trimmed
 }
 
+
+// MARK: - 锁屏解锁
+//
+// 锁屏时 loginwindow 接管，postToPid 定向投递无效——它只认真实 HID 事件。
+// 流程：唤醒屏幕 → 全局注入密码 → 回车 → 复查锁屏状态。
+// 密码只作为本次调用参数，不落盘。
+
+import IOKit.pwr_mgt
+
+func wakeScreen() {
+    var assertionID: IOPMAssertionID = 0
+    _ = IOPMAssertionDeclareUserActivity(
+        "dsh-cua unlock" as CFString,
+        kIOPMUserActiveLocal,
+        &assertionID
+    )
+}
+
+/// 全局注入文本（HID tap 而非 postToPid）。锁屏界面用这个。
+func typeTextHID(_ text: String) {
+    guard let src = CGEventSource(stateID: .hidSystemState) else { return }
+    let units = Array(text.utf16)
+    var i = 0
+    while i < units.count {
+        let chunk = Array(units[i..<min(i + 16, units.count)])
+        guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else { return }
+        chunk.withUnsafeBufferPointer { buf in
+            down.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress!)
+            up.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress!)
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        i += chunk.count
+        usleep(6_000)
+    }
+}
+
+/// 单个按键的全局注入。Return 用 keyCode 36。
+func postKeyHID(_ keyCode: CGKeyCode) {
+    guard let src = CGEventSource(stateID: .hidSystemState) else { return }
+    CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)?.post(tap: .cghidEventTap)
+    usleep(20_000)
+    CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)?.post(tap: .cghidEventTap)
+}
+
+func toolUnlockScreen(_ args: [String: Any]) throws -> [[String: Any]] {
+    let password = (args["password"] as? String) ?? ""
+    if !isScreenLocked() {
+        return [["type": "text", "text": "屏幕已解锁，无需操作"]]
+    }
+    // 不唤醒的话注入落在黑屏上，等于没输
+    wakeScreen()
+    usleep(900_000)
+    if password.isEmpty {
+        return [["type": "text", "text": "已唤醒屏幕，但未提供密码，等待人工解锁"]]
+    }
+    typeTextHID(password)
+    usleep(300_000)
+    postKeyHID(36)   // return
+    usleep(1_200_000)
+    if isScreenLocked() {
+        return [["type": "text", "text": "已尝试注入密码但屏幕仍处于锁定状态。请确认密码是否正确，或手动解锁。"]]
+    }
+    return [["type": "text", "text": "屏幕已解锁"]]
+}
+
 func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let q = args["app"] as? String else { throw CUAError.badRequest("app 必填") }
     let ref = try resolveApp(q)
@@ -1408,15 +1515,29 @@ func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
         let quality = (args["quality"] as? Double) ?? 0.6
         if let wid = windowID(for: ref.pid),
            let shot = try? captureWindowFrame(pid: ref.pid, windowID: wid, maxDim: maxDim, quality: quality) {
-            let previous = lastShotHash[ref.pid]
-            if shotMode == "auto", previous == shot.hash {
-                // 画面没变就不重复附图：一张 1600px 的图要占上千 token
-                content.append([
-                    "type": "text",
-                    "text": "[画面与上次一致，未重复附图；需要强制取图请传 screenshot=\"always\"]",
-                ])
+            let previous = lastShot[ref.pid]
+            // 信息量判据（Codex 用 SkyshotClassifier，这里用可判定的信号替代）：
+            //   1. 近乎纯色 → 这张图没有可读内容
+            //   2. 与上帧逐位相同 → 没有任何变化
+            //   3. 与上帧仅差 1-2 位且树几乎没动 → 变化不值得一张图
+            let treeMoved = snap.changed + snap.added + snap.removed
+            var skipReason: String?
+            if shotMode == "auto" {
+                if shot.sig.spread < 2.0 {
+                    skipReason = "[画面近乎纯色，无有效信息，未附图]"
+                } else if let p = previous {
+                    let dist = hamming(p.hash, shot.sig.hash)
+                    if dist == 0 {
+                        skipReason = "[画面与上次一致，未重复附图；需要强制取图请传 screenshot=\"always\"]"
+                    } else if dist <= 2, treeMoved <= 2 {
+                        skipReason = "[画面与上帧仅有细微差异（汉明距离 \(dist)，树变化 \(treeMoved) 处），未附图]"
+                    }
+                }
+            }
+            if let reason = skipReason {
+                content.append(["type": "text", "text": reason])
             } else {
-                lastShotHash[ref.pid] = shot.hash
+                lastShot[ref.pid] = shot.sig
                 content.append([
                     "type": "image",
                     "data": shot.data.base64EncodedString(),
@@ -1882,6 +2003,11 @@ let tools: [ToolDef] = [
             schema: obj([:], [])),
     ToolDef(name: "screen_state", description: "返回 locked 或 unlocked。锁屏时其它工具都会失败。",
             schema: obj([:], [])),
+    ToolDef(name: "unlock_screen",
+            description: "唤醒屏幕并注入密码解锁。密码只用于本次调用，不落盘。不传密码则只唤醒。",
+            schema: obj([
+                "password": ["type": "string", "description": "登录密码；省略则只唤醒屏幕等待人工解锁"],
+            ], [])),
     ToolDef(name: "get_app_state",
             description: "获取应用的辅助功能树文本，以及一张截图。返回的 [数字] 是元素 ID，供后续动作使用。元素 ID 跨快照稳定，界面变化后仍可沿用。",
             schema: obj([
@@ -1976,8 +2102,13 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
         }
         let args = (params["arguments"] as? [String: Any]) ?? [:]
         // 锁屏时所有依赖 AX / 截屏 / 注入的工具都会失败，先给准确原因
-        if isScreenLocked(), name != "list_apps", name != "screen_state" {
-            throw CUAError.badRequest("屏幕已锁定（loginwindow 接管）。AX 读取、截屏与输入投递都不可用，请先解锁屏幕再重试。")
+        if isScreenLocked(), name != "list_apps", name != "screen_state", name != "unlock_screen" {
+            throw CUAError.badRequest("屏幕已锁定（loginwindow 接管）。AX 读取、截屏与输入投递都不可用，可用 unlock_screen 唤醒解锁。")
+        }
+        // 应用策略：带 app 参数的工具在落到目标之前先过白/黑名单
+        if let appQuery = args["app"] as? String, let target = try? resolveApp(appQuery),
+           let reason = policyDecision(for: target) {
+            throw CUAError.badRequest(reason)
         }
         let content: [[String: Any]]
         switch name {
@@ -1986,6 +2117,7 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
             "type": "text",
             "text": isScreenLocked() ? "locked" : "unlocked",
         ]]
+        case "unlock_screen": content = try toolUnlockScreen(args)
         case "get_app_state": content = try toolGetAppState(args)
         case "click": content = try toolClick(args)
         case "type_text": content = try toolTypeText(args)
@@ -2064,6 +2196,7 @@ func selfTest() -> Int32 {
     let cfg = CuaConfig.current()
     print("config path:", CuaConfig.path)
     print("config readable:", FileManager.default.isReadableFile(atPath: CuaConfig.path))
+    print("config policy: denied=\(cfg.deniedBundleIDs.count) allowed=\(cfg.allowedBundleIDs.count)")
     print("config cdpPort:", cfg.browserCdpPort, "overlay:", cfg.overlayEnabled,
           "ttl:", cfg.overlayTtlSeconds, "cap:", cfg.maxElements)
     print(ok ? "SELFTEST PASS" : "SELFTEST FAIL")

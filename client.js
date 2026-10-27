@@ -66,6 +66,18 @@ window.__ModuleLoader__.load({
         label: 'AX 快照节点上限',
         hint: '界面复杂时快照会被截断，可调大。',
       },
+      {
+        field: 'deniedBundleIDs',
+        kind: 'list',
+        label: '禁止操作的应用',
+        hint: 'bundleID 列表，逗号分隔。命中即在分发层拒绝，例如 com.apple.finder',
+      },
+      {
+        field: 'allowedBundleIDs',
+        kind: 'list',
+        label: '只允许操作的应用',
+        hint: 'bundleID 列表，逗号分隔。非空时其余应用一律拒绝，优先级高于禁止列表。',
+      },
     ]
 
     /** React useSyncExternalStore 契约的快照容器。 */
@@ -106,6 +118,20 @@ window.__ModuleLoader__.load({
       boolean: {
         format: (value) => value === true,
         parse: (input) => ({ kind: 'set', value: input === true }),
+      },
+      list: {
+        // 数组用逗号分隔的一行文本编辑：bundleID 列表不值得为它做增删控件
+        format: (value) =>
+          Array.isArray(value) ? value.join(', ') : typeof value === 'string' ? value : '',
+        parse: (input) => {
+          const text = String(input ?? '').trim()
+          if (text === '') return { kind: 'set', value: [] }
+          const items = text
+            .split(/[,，\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+          return { kind: 'set', value: items }
+        },
       },
     }
 

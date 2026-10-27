@@ -73,6 +73,7 @@ dsh plugin --profile web add file:/path/to/dsh-cua
 |---|---|
 | `list_apps` | 列出运行中的图形应用 |
 | `screen_state` | 返回 `locked` / `unlocked` |
+| `unlock_screen` | 唤醒屏幕并按需注入密码解锁；密码不落盘 |
 | `get_app_state` | AX 树文本 + 截图；默认增量，`[数字]` 跨快照稳定 |
 | `click` | 点元素中心或屏幕坐标，支持双击、右键 |
 | `type_text` | Unicode 直接注入，不走剪贴板 |
@@ -220,17 +221,23 @@ Codex 让长会话不炸上下文的几个设计，这里逐条对齐。
 移除项按 ID 区间汇总（`ID 100-102,105`），不逐条吐原文——界面大改一次就是几十行。
 `diff=cumulative` 则与最初那棵树比较。
 
-**截图去重。** 8×8 灰度平均哈希比对上一帧，画面没变就不重复附图——
-一张 1600px 的截图要占上千 token，长会话里「界面没动也重发」是主要浪费。
+**截图去重。** 8×8 灰度采样算两个量：平均哈希（画面变没变）和标准差（有没有效内容）。
+据此跳过三种情况：近乎纯色的画面、与上一帧逐位相同、以及仅差 1-2 位且树几乎没动的
+微小变化。一张 1600px 的截图要占上千 token，长会话里「界面没动也重发」是主要浪费。
 `diff=none` 取全量，`screenshot=always` 强制附图。
+
+**应用策略。** 白/黑名单按 bundleID 精确匹配，在工具分发层拒绝，
+动作不会落到目标应用上。Codex 那侧是 MDM 下发的组织策略，本机场景只需要一张表。
 
 **元素失效重取。** 每个元素记一条结构路径指纹。AX 引用失效时按路径重新定位，
 role 对得上才认——路径相撞时宁可报错也不能点错控件。模型手里的 ID 跨多次界面
 变化仍然可用，不必每步重取整棵树。自检里 60 个采样元素路径解析 60/60 命中。
 
 **锁屏。** 锁屏时 AX 读取、截屏、事件注入全部被系统挡掉，逐个工具报错会让模型
-误判成「元素找不到」反复重试。现在统一拦在前面返回原因，另有 `screen_state`
-工具直接查状态。
+误判成「元素找不到」反复重试。现在统一拦在前面返回原因，`screen_state` 查状态，
+`unlock_screen` 负责唤醒和解锁：`IOPMAssertionDeclareUserActivity` 点亮屏幕，
+再用 HID tap 全局注入密码（锁屏时 `postToPid` 无效，loginwindow 只认真实事件）。
+密码只作为本次调用参数，不写进任何配置文件。
 
 ## 实时画面
 
@@ -280,11 +287,11 @@ EOF
 |---|---|---|
 | AX 树 diff | 三档 diff，省 token | 已实现：`diff=auto` 只报变化节点 |
 | 元素失效重取 | `RefetchableUIElement` + invalidation monitor | 已实现：结构路径指纹自动找回 |
-| 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 部分：8×8 指纹相同则不重复附图 |
+| 截图按需分类 | `SkyshotClassifier` 判断是否要截图 | 部分：纯色/微小变化/无变化三种判据 |
 | 虚拟光标动画 | `ComputerUseCursor` + Lens 帧 | 已实现：移动光环 + 点击涟漪（现画，非帧序列）|
 | 实时画面回显 | `RemoteHostedPIP*` 全套 | 已实现：对话页右上角 MJPEG 小窗 |
-| 锁屏处理 | Guardian + AuthorizationPlugin | 部分：检测并给出明确原因，不解锁 |
-| 应用级策略 | 组织策略 + 内置黑名单 | 无 |
+| 锁屏处理 | Guardian + AuthorizationPlugin | 已实现：检测 + 唤醒 + 可选密码解锁 |
+| 应用级策略 | 组织策略 + 内置黑名单 | 已实现：白/黑名单按 bundleID 拦在分发层 |
 | 审批弹窗 | `createElicitation` + 4 级确认策略 | 无，依赖 harness 自身审批 |
 | 私有截图路径 | `captureScreenshotWithSkyLight` | 无，只用公开 SCK |
 | 每应用提示词 | `AppInstructions/*.md` | 已实现：`~/.dsh/dsh-cua-instructions/<bundleID>.md` |
@@ -322,6 +329,8 @@ toolCallTimeoutMs: 180000     # 单次调用超时，截图慢时可加
 | `backgroundSilence` | `true` | 用 `postToPid` 定向投递，不抢焦点；关掉改用真实 HID |
 | `scrollStepPx` | `40` | 滚动单步像素；过大时 Catalyst 应用会丢事件 |
 | `maxElements` | `4000` | 单次快照的节点上限，超出截断 |
+| `deniedBundleIDs` | `[]` | 禁止操作的应用；命中即在分发层拒绝 |
+| `allowedBundleIDs` | `[]` | 只允许操作的应用；非空时其余一律拒绝，优先级高于禁止列表 |
 
 ---
 
