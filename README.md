@@ -249,6 +249,11 @@ Codex 让长会话不炸上下文的几个设计，这里逐条对齐。
 微小变化。一张 1600px 的截图要占上千 token，长会话里「界面没动也重发」是主要浪费。
 `diff=none` 取全量，`screenshot=always` 强制附图。
 
+**滚动惯性。** 对应 Codex 的 `waitForUIToSettle(includingScrollEvents:)`。滚动后不立刻返回，
+而是盯住主窗口内前若干行的 Y 坐标，连续 120ms 没有位移才算停稳——惯性期间下点击会打偏。
+判据用行位置而不是滚动条 value：Finder 的列表区是 `AXOutline`，不套 `AXScrollArea`，
+应用级那个 `AXScrollArea` 是「桌面」，滚动条恒为 0，拿它当判据会立刻误判成已停。
+
 **角色压平。** 对应 Codex 的 `UIElementFlattenedRole`：既没有标题、描述、值、动作、
 也不是焦点的 `AXGroup` / `AXGenericElement` 容器不输出自己的行，子节点原地提升一层。
 元素仍然注册（id 与路径不变），只是不占文本和缩进。Finder 列表视图 152 行降到 147 行。

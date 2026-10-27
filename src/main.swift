@@ -1478,6 +1478,73 @@ func keyCodeForCharacter(_ ch: Character) -> CGKeyCode? {
     return nil
 }
 
+
+// MARK: - 滚动惯性
+//
+// 对应 Codex 的 waitForUIToSettle(includingScrollEvents: true)。
+// 滚动有惯性：事件发完页面还在滑，此时点元素会点到滑动中的位置。
+// 判据是滚动条 value 连续一段时间不再变化。
+
+/// 滚动锚点：主窗口内第一个行/单元格的 Y 坐标。
+/// 不能用滚动条 value 当判据——Finder 的列表区是 AXOutline，不套 AXScrollArea，
+/// 应用级的 AXScrollArea 是「桌面」，滚动条恒为 0，会立刻误判成已停。
+/// 行的 Y 坐标随滚动变化，是这套 UI 里最直接的位移信号。
+func findFirstRole(_ el: AXUIElement, _ role: String, _ depth: Int = 0) -> AXUIElement? {
+    if depth > 20 { return nil }
+    if let r = attr(el, kAXRoleAttribute as String) as? String, r == role { return el }
+    for k in childrenOf(el) {
+        if let hit = findFirstRole(k, role, depth + 1) { return hit }
+    }
+    return nil
+}
+
+/// 滚动签名：主窗口内前若干个行的 Y 坐标。
+/// 单个锚点会踩空（第一行可能是固定在顶部的表头），取一组更稳：
+/// 只要有任意一行位移，签名就变。
+func scrollSignature(_ root: AXUIElement) -> [Double]? {
+    var ys: [Double] = []
+    func walk(_ el: AXUIElement, _ depth: Int) {
+        if depth > 20 || ys.count >= 8 { return }
+        if let r = attr(el, kAXRoleAttribute as String) as? String,
+           r == "AXRow" || r == "AXCell" || r == "AXListItem" {
+            if let p = pointAttr(el, "AXPosition") { ys.append(p.y) }
+        }
+        for k in childrenOf(el) { walk(k, depth + 1) }
+    }
+    walk(root, 0)
+    return ys.isEmpty ? nil : ys
+}
+
+/// 等滚动停稳。找不到滚动条时退化为短等，不空耗。
+func waitForScrollToSettle(pid: pid_t, timeout: TimeInterval = 1.2) {
+    let appEl = AXUIElementCreateApplication(pid)
+    let dbg = ProcessInfo.processInfo.environment["CUA_DEBUG_SCROLL"] != nil
+    guard let win = attr(appEl, kAXMainWindowAttribute as String),
+          CFGetTypeID(win) == AXUIElementGetTypeID() else {
+        if dbg { FileHandle.standardError.write(Data("settle: 无主窗口\n".utf8)) }
+        waitForChange(pid: pid, timeout: 0.2)
+        return
+    }
+    // 锚点从应用根找，不限于 AXMainWindow：Finder 的 AXMainWindow 常是桌面窗口
+    guard var last = scrollSignature(appEl) ?? scrollSignature(win as! AXUIElement) else {
+        if dbg { FileHandle.standardError.write(Data("settle: 无滚动锚点\n".utf8)) }
+        waitForChange(pid: pid, timeout: 0.2)
+        return
+    }
+    var quietSince = Date()
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        usleep(40_000)
+        let cur = scrollSignature(appEl) ?? last
+        if cur != last {
+            last = cur
+            quietSince = Date()
+        } else if Date().timeIntervalSince(quietSince) >= 0.12 {
+            return
+        }
+    }
+}
+
 let keyCodes: [String: CGKeyCode] = [
     "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
     "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
@@ -1649,8 +1716,9 @@ func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) thr
 
     if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid,
        let app = NSRunningApplication(processIdentifier: pid) {
-        app.activate(options: [])
-        usleep(200_000)
+        // 滚轮走 .cghidEventTap，只有真前台才收得到；空 options 在新系统上不够
+        app.activate(options: [.activateIgnoringOtherApps])
+        usleep(250_000)
     }
     if let p = point {
         guard let m = CGEvent(mouseEventSource: src, mouseType: .mouseMoved,
@@ -2401,11 +2469,25 @@ func toolScroll(_ args: [String: Any]) throws -> [[String: Any]] {
     guard let dir = args["direction"] as? String else { throw CUAError.badRequest("direction 必填") }
     let ref = try resolveApp(q)
     Overlay.mark(pid: ref.pid, appName: ref.name)
+    // 与 click 一致：目标不认为自己在前台时滚动事件会被丢弃
+    prepareTarget(pid: ref.pid)
     let pages = (args["pages"] as? Double) ?? 1.0
-    let pt = try? resolvePoint(args, pid: ref.pid)
+    var pt = try? resolvePoint(args, pid: ref.pid)
+    if pt == nil {
+        // 没给坐标就用目标窗口中心。滚轮事件落在鼠标当前位置，
+        // 不先移过去就会滚到用户正在看的那个窗口上。
+        let appEl = AXUIElementCreateApplication(ref.pid)
+        if let w = attr(appEl, kAXMainWindowAttribute as String),
+           CFGetTypeID(w) == AXUIElementGetTypeID(),
+           let p = pointAttr(w as! AXUIElement, "AXPosition"),
+           let sz = sizeAttr(w as! AXUIElement, "AXSize"), sz.width > 0 {
+            pt = CGPoint(x: p.x + sz.width / 2, y: p.y + sz.height / 2)
+        }
+    }
     if let pt = pt { Overlay.cursorMove(x: pt.x, y: pt.y) }
     try scrollAt(pid: ref.pid, point: pt, direction: dir, pages: pages)
-    waitForChange(pid: ref.pid, timeout: 0.5)
+    // 等惯性滑停再往下走，否则后续点击会打偏
+    waitForScrollToSettle(pid: ref.pid)
     return [["type": "text", "text": "已在 \(ref.name) 向 \(dir) 滚动 \(pages) 页"]]
 }
 
