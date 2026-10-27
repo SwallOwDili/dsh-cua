@@ -429,9 +429,25 @@ window.__ModuleLoader__.load({
             '画面暂不可用',
           )
 
+      // 点击小窗直接跳到被操作的那个窗口。
+      // 与后台操作相反：这是用户主动要看，就该把窗口提到前面。
+      const focusTarget = () => {
+        if (!status.active) return
+        fetch(LIVE_BASE + '/focus', { cache: 'no-store' }).catch(() => {})
+      }
+
       return React.createElement(
         'div',
-        { style: liveCss.wrap, title: 'AI 正在操作的窗口（实时）' },
+        {
+          style: Object.assign({}, liveCss.wrap, status.active ? { cursor: 'pointer' } : null),
+          title: status.active ? '点击跳到这个窗口' : 'AI 正在操作的窗口（实时）',
+          onClick: focusTarget,
+          role: status.active ? 'button' : undefined,
+          tabIndex: status.active ? 0 : undefined,
+          onKeyDown: (e) => {
+            if (e.key === 'Enter' || e.key === ' ') focusTarget()
+          },
+        },
         body,
         React.createElement(
           'span',

@@ -270,6 +270,33 @@ let workQueue = DispatchQueue(label: "cua.live.server")
 // 启动时在主线程摸一次 CGMainDisplayID，把连接建起来。
 _ = CGMainDisplayID()
 
+
+// MARK: - 聚焦目标窗口
+//
+// 点击对话页右上角的小窗 → 直接跳到被操作的那个窗口。
+// 与后台操作相反：这是用户主动要求，就该把窗口提到前台。
+
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+func raiseWindow(pid: pid_t, windowID: CGWindowID) -> Bool {
+    guard AXIsProcessTrusted() else { return false }
+    let app = AXUIElementCreateApplication(pid)
+    guard let wins = attr(app, kAXWindowsAttribute) as? [AXUIElement] else { return false }
+    for w in wins {
+        var wid: CGWindowID = 0
+        guard _AXUIElementGetWindow(w, &wid) == .success, wid == windowID else { continue }
+        return AXUIElementPerformAction(w, kAXRaiseAction as CFString) == .success
+    }
+    return false
+}
+
+func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success else { return nil }
+    return v
+}
+
 // MARK: - HTTP
 
 func httpResponse(_ status: String, _ contentType: String, _ body: Data) -> Data {
@@ -342,6 +369,24 @@ func handleConnection(_ conn: NWConnection) {
                 "width": info.width,
                 "height": info.height,
                 "viewers": state.clientCount(),
+            ]), completion: .contentProcessed { _ in conn.cancel() })
+
+        case (_, "/focus"):
+            guard let t = state.activeTarget() else {
+                conn.send(content: jsonResponse(["ok": false, "reason": "当前没有操作目标"]),
+                          completion: .contentProcessed { _ in conn.cancel() })
+                break
+            }
+            // 先把目标窗口在应用内提到最前，再激活应用——
+            // 多窗口应用只激活不 raise 的话，用户看到的是别的窗口。
+            let raised = raiseWindow(pid: t.pid, windowID: t.windowID)
+            let activated = NSRunningApplication(processIdentifier: t.pid)?
+                .activate(options: [.activateIgnoringOtherApps]) ?? false
+            conn.send(content: jsonResponse([
+                "ok": activated || raised,
+                "app": t.appName,
+                "raised": raised,
+                "activated": activated,
             ]), completion: .contentProcessed { _ in conn.cancel() })
 
         case (_, "/target"):
