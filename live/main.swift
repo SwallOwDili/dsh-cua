@@ -347,6 +347,23 @@ func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
 
 // MARK: - HTTP
 
+/// 记录请求，用来判断前端到底有没有在轮询（netstat 抓不到 fetch 的短连接）。
+enum RequestLog {
+    static let path = "/tmp/cua-live-requests.log"
+    static let lock = NSLock()
+    static func note(_ p: String) {
+        lock.lock(); defer { lock.unlock() }
+        let line = "\(Date().timeIntervalSince1970) \(p)\n"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8)!)
+            h.closeFile()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
 func httpResponse(_ status: String, _ contentType: String, _ body: Data) -> Data {
     var head = "HTTP/1.1 \(status)\r\n"
     head += "Content-Type: \(contentType)\r\n"
@@ -404,6 +421,7 @@ func handleConnection(_ conn: NWConnection) {
 
         switch (method, route) {
         case (_, "/status"):
+            RequestLog.note(rawPath)
             let list = state.snapshot(session: params["session"])
             conn.send(content: jsonResponse([
                 "active": !list.isEmpty,

@@ -397,20 +397,35 @@ window.__ModuleLoader__.load({
     let sessionsRef = null
 
     function LivePreview() {
-      const sessions = sessionsRef
       const [status, setStatus] = React.useState(null)
       // 当前会话：只有本会话发起的操作才在这里出预览。
       // cua-mcp 经 MCP _meta 带上会话标识，cua-live 按它归属目标窗口。
-      const [sessionId, setSessionId] = React.useState(
-        () => (sessions ? sessions.list.getSnapshot().current ?? '' : ''),
-      )
-
+      // 会话标识只用于过滤，拿不到就退化成「显示全部」。
+      // 任何一步都不能抛错：组件在 slot 的 crash 边界里，
+      // 一旦抛出就被静默吞掉，右上角表现为彻底没有预览。
+      const [sessionId, setSessionId] = React.useState('')
       React.useEffect(() => {
-        if (!sessions) return undefined
-        const read = () => setSessionId(sessions.list.getSnapshot().current ?? '')
+        const sessions = sessionsRef
+        if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') {
+          return undefined
+        }
+        const read = () => {
+          try {
+            setSessionId(sessions.list.getSnapshot()?.current ?? '')
+          } catch {
+            setSessionId('')
+          }
+        }
         read()
-        return sessions.list.subscribe(read)
-      }, [sessions])
+        try {
+          const stop = sessions.list.subscribe(read)
+          return () => {
+            try { stop?.() } catch { /* 忽略 */ }
+          }
+        } catch {
+          return undefined
+        }
+      }, [])
 
       React.useEffect(() => {
         let alive = true
@@ -729,7 +744,10 @@ window.__ModuleLoader__.load({
     }
 
     /** 需要的宿主服务：slot 注册表与 settings 作用域。 */
-    const inject = ['slots', 'settingsScope', 'sessions']
+    // 不把 sessions 列进 inject：客户端没有这个服务名的话，
+    // 插件会一直等它，apply 永远不执行，连配置卡片都不会渲染。
+    // 会话标识只是过滤用的增强，改成运行时按需取，取不到就显示全部。
+    const inject = ['slots', 'settingsScope']
 
     /**
      * 挂载配置卡片。
@@ -754,13 +772,17 @@ window.__ModuleLoader__.load({
       })
       // 对话页右上角的实时画面。没有活跃目标时组件自己渲染 null，
       // 不占位、不显示空框。
-      sessionsRef = ctx.sessions
-      ctx.slots.inject('conversation.session.header.corner', () =>
-        ctx.slots.register(
+      try {
+        sessionsRef = ctx.sessions ?? ctx.get?.('sessions') ?? null
+      } catch {
+        sessionsRef = null
+      }
+      ctx.slots.inject('conversation.session.header.corner', function* () {
+        yield ctx.slots.register(
           { name: 'conversation.session.header.corner' },
           LivePreview,
-        ),
-      )
+        )
+      })
     }
 
     exports.name = 'cua'
