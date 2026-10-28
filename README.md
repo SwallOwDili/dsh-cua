@@ -32,7 +32,7 @@ Elements: 122
 一条命令，不需要 clone，不需要 Xcode：
 
 ```bash
-curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-1.12.8-macos-universal.tar.gz | tar xz
+curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-1.12.9-macos-universal.tar.gz | tar xz
 ```
 
 解压出 `dsh-cua/`，里面的 `bin/` 已经是 arm64 + x86_64 通用二进制。
@@ -193,6 +193,8 @@ echo "$(pwd)/bin/cua-mcp"
 - **拖拽**：仍走全局事件并会让目标前置，这是部分 Catalyst 应用的要求。
 - **锁屏**：`unlock_screen` 需要系统密码，只在明确调用时使用，不保存密码。
 - **并行使用**：多个客户端共用同一个实时画面服务，目标按会话分流，互不可见。
+- **实时画面不出本机**：预览用的 18901 端口只绑 `127.0.0.1`，同网段访问不到；
+  画面直接由本机进程推到浏览器，不经过任何外部服务。
 
 ## 许可
 

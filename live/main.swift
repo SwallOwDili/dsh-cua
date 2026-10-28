@@ -721,7 +721,14 @@ guard let port = NWEndpoint.Port(rawValue: listenPort) else {
 do {
     let params = NWParameters.tcp
     params.allowLocalEndpointReuse = true
-    let listener = try NWListener(using: params, on: port)
+    // 只绑回环。NWParameters.tcp 默认监听 0.0.0.0/::，而本服务能做的事是：
+    //   /target?pid=<任意应用>  把它注册成捕获目标
+    //   /live.mjpg              拉该窗口的实时画面
+    //   /focus                  把窗口提到最前
+    // 全程没有鉴权，而 cua-live 是带屏幕录制授权跑的。绑在通配地址上，
+    // 同网段任何人（或本机任意网页）都能把屏幕画面拉走。实测过 lsof 是 `*:18901`。
+    params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: port)
+    let listener = try NWListener(using: params)
     listener.newConnectionHandler = { conn in handleConnection(conn) }
     listener.stateUpdateHandler = { st in
         if case let .failed(err) = st {

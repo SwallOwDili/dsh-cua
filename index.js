@@ -19,7 +19,7 @@
 
 import { existsSync, accessSync, constants, writeFileSync } from 'node:fs'
 import { McpBridge, toParameters, toText } from './mcp-bridge.js'
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import path from 'node:path'
@@ -127,23 +127,36 @@ export const RUNTIME_CONFIG_PATH = path.join(
 /**
  * 跑一次 --selftest，把 AX / 屏幕录制 / CGEvent 三项状态取回来。
  * 自检本身不触发授权弹窗，只读当前 TCC 状态。
+ *
+ * 用异步 execFile 而不是 execFileSync：自检要抓一棵真实的无障碍树、
+ * 还要做 60 次路径重取验证，慢的时候几秒钟。同步跑会把宿主启动堵在这里
+ * （最长 30 秒超时），而这只是「检查」，没必要挡住别人。
  */
 function runSelfTest(binary) {
-  const out = execFileSync(binary, ['--selftest'], {
-    encoding: 'utf8',
-    timeout: 30_000,
-    stdio: ['ignore', 'pipe', 'pipe'],
+  return new Promise((resolve, reject) => {
+    execFile(
+      binary,
+      ['--selftest'],
+      { encoding: 'utf8', timeout: 30_000, maxBuffer: 1 << 20 },
+      (error, stdout) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        const out = String(stdout ?? '')
+        const read = (label) => {
+          const line = out.split('\n').find((l) => l.startsWith(label))
+          return line ? line.slice(label.length).trim() : null
+        }
+        resolve({
+          raw: out,
+          accessibility: read('AX trusted:') === 'true',
+          screenRecording: read('screen capture preflight:') === 'true',
+          passed: out.includes('SELFTEST PASS'),
+        })
+      },
+    )
   })
-  const read = (label) => {
-    const line = out.split('\n').find((l) => l.startsWith(label))
-    return line ? line.slice(label.length).trim() : null
-  }
-  return {
-    raw: out,
-    accessibility: read('AX trusted:') === 'true',
-    screenRecording: read('screen capture preflight:') === 'true',
-    passed: out.includes('SELFTEST PASS'),
-  }
 }
 
 /** 最近一次 flush 的配置快照，工具执行时读，避免每次重解析。 */
@@ -193,8 +206,6 @@ export async function apply(ctx, config) {
   })
 
   ctx.effect(() => () => bridge.stop(), 'dsh-cua: cua-mcp 生命周期')
-  bridge.start()
-
 
   // ---- 操作前确认（对齐 Codex 的 AppApprovalRequested / Resolved） ----
   //
@@ -204,6 +215,10 @@ export async function apply(ctx, config) {
   const WRITE_TOOLS = new Set([
     'click', 'type_text', 'press_key', 'scroll', 'set_value',
     'select_text', 'paste', 'perform_secondary_action', 'open_app', 'drag',
+    // unlock_screen 会全局注入登录密码（HID tap，不是定向投递），
+    // browser_eval 能在已登录的浏览器里执行任意 JS——两者都是不折不扣的写操作，
+    // 早先漏在这张表外面，approvalMode 对它们完全无效。
+    'unlock_screen', 'browser_eval',
   ])
   const approvedScopes = new Set()
   // 不能在这里取一次快照。approval 服务若晚于插件就绪，
@@ -248,44 +263,67 @@ export async function apply(ctx, config) {
     throw new Error(`dsh-cua: ${label}，${toolName} 未执行`)
   }
 
-  try {
-    await bridge.initialize()
-    const tools = await bridge.listTools()
-    const disposers = []
-    for (const tool of tools) {
-      disposers.push(
-        ctx.tools.register({
-          name: tool.name,
-          description: tool.description ?? '',
-          parameters: toParameters(tool.inputSchema),
-          output: {
-            schema: {
-              type: 'object',
-              additionalProperties: false,
-              properties: { text: { type: 'string', required: true } },
-              required: ['text'],
+  // 工具表来自子进程的 tools/list，只有拿到它才知道挂什么。
+  // 一次失败就把整个会话变成「没有任何工具」，而多数失败都是瞬时的
+  // （二进制正在被 build.sh 覆盖、握手竞争）。所以给它三次退避重试。
+  const disposers = []
+  let mounted = false
+  const mountTools = async (attempt = 1) => {
+    if (mounted) return
+    try {
+      await bridge.ensureReady()
+      const tools = await bridge.listTools()
+      if (mounted) return
+      for (const tool of tools) {
+        disposers.push(
+          ctx.tools.register({
+            name: tool.name,
+            description: tool.description ?? '',
+            parameters: toParameters(tool.inputSchema),
+            output: {
+              schema: {
+                type: 'object',
+                additionalProperties: false,
+                properties: { text: { type: 'string', required: true } },
+                required: ['text'],
+              },
+              render: (_args, value) => [{ type: 'text', text: value.text }],
             },
-            render: (_args, value) => [{ type: 'text', text: value.text }],
-          },
-          execute: async (args, exec) => {
-            await askApproval(tool.name, args, exec)
-            // exec.agent.id 就是发起这次调用的会话；后台任务可能没有 agent
-            const sessionId = exec?.agent?.id
-            const result = await bridge.callTool(tool.name, args, sessionId)
-            const text = toText(result)
-            if (result?.isError) throw new Error(text || `${tool.name} 执行失败`)
-            return { text }
-          },
-        }),
+            execute: async (args, exec) => {
+              await askApproval(tool.name, args, exec)
+              // exec.agent.id 就是发起这次调用的会话；后台任务可能没有 agent
+              const sessionId = exec?.agent?.id
+              const result = await bridge.callTool(tool.name, args, sessionId)
+              const text = toText(result)
+              if (result?.isError) throw new Error(text || `${tool.name} 执行失败`)
+              return { text }
+            },
+          }),
+        )
+      }
+      mounted = true
+      ctx.logger?.info?.(`dsh-cua: 已挂载 ${tools.length} 个工具`)
+    } catch (error) {
+      if (attempt >= 3) {
+        ctx.logger?.error?.(
+          `dsh-cua: 挂载工具失败，已重试 ${attempt} 次 — ${error.message}`,
+        )
+        return
+      }
+      const wait = attempt === 1 ? 1_000 : 3_000
+      ctx.logger?.warn?.(
+        `dsh-cua: 挂载工具失败（第 ${attempt} 次）— ${error.message}，${wait / 1000}s 后重试`,
       )
+      setTimeout(() => {
+        void mountTools(attempt + 1)
+      }, wait)
     }
-    ctx.effect(() => () => {
-      for (const dispose of disposers) dispose()
-    }, 'dsh-cua: 工具注销')
-    ctx.logger?.info?.(`dsh-cua: 已挂载 ${tools.length} 个工具`)
-  } catch (error) {
-    ctx.logger?.error?.(`dsh-cua: 挂载工具失败 — ${error.message}`)
   }
+  await mountTools()
+
+  ctx.effect(() => () => {
+    for (const dispose of disposers) dispose()
+  }, 'dsh-cua: 工具注销')
 
   // ---- 配置页：等 settings 就绪后注册命名空间，把值落盘给 cua-mcp ----
   // 用 ctx.inject 而不是顶层 inject：插件本体不等服务，工具照常可用。
@@ -327,7 +365,7 @@ export async function apply(ctx, config) {
 
   let result
   try {
-    result = runSelfTest(binary)
+    result = await runSelfTest(binary)
   } catch (error) {
     const message = `dsh-cua: 自检执行失败 — ${error.message}`
     if (config.failOnPermissionError) throw new Error(message)

@@ -50,13 +50,11 @@ var initialBaselines: [pid_t: [String: BaselineEntry]] = [:]
 /// 我这边 `element()` 本来就是每次读一次 role 判断死活，
 /// 所以监听在当前实现里的实际收益是**让 CGWindowID 缓存立即失效**——
 /// 窗口开关之后不会再拿旧窗口号去截图。监听本身不需要它也能正确工作。
-var invalidationCount: [pid_t: Int] = [:]
 var axObservers: [pid_t: AXObserver] = [:]
 
 let invalidationCallback: AXObserverCallback = { _, _, _, refcon in
     guard let refcon else { return }
     let pid = pid_t(Int(bitPattern: refcon))
-    invalidationCount[pid, default: 0] += 1
     // 窗口结构变了，缓存的 CGWindowID 可能指向已经消失的窗口——
     // 直接清掉，下次按需重取，避免截图截到错窗口。
     windowIDCache.removeValue(forKey: pid)
@@ -195,19 +193,24 @@ enum History {
     }
 
     /// 追加一条活动事件。段满则滚动。
+    ///
+    /// `app` 必须是**解析后的 bundleID**，不是模型输入的原始串。
+    /// 早期版本把 `args["app"]`（可能是 "Safari" 或一条路径）直接拿去比对
+    /// ignoredBundleIDs（"com.apple.Safari"），忽略名单永远命中不了；
+    /// 聚合出的 memory.md 也会按输入串分组，同一应用裂成好几条。
     static func record(tool: String, args: [String: Any], app: String?, status: String, ms: Int) {
         // 两道闸：配置页的总开关（持久）与 history 工具的临时暂停
         guard CuaConfig.current().historyEnabled else { return }
         let st = loadSettings()
         guard st.enabled, !st.paused else { return }
-        if let b = args["app"] as? String, st.ignoredBundleIDs.contains(b) { return }
+        if let a = app, !a.isEmpty, st.ignoredBundleIDs.contains(a) { return }
 
         ensureDirs()
         let now = ISO8601DateFormatter().string(from: Date())
         let event: [String: Any] = [
             "ts": now,
             "tool": tool,
-            "app": app ?? (args["app"] as? String) ?? "",
+            "app": app ?? "",
             "status": status,
             "ms": ms,
             "args": redact(args),
@@ -528,42 +531,75 @@ func allApps() -> [NSRunningApplication] {
     return list
 }
 
+/// 从查询串推断 bundleID，不启动任何东西。
+/// 路径读 Info.plist；形如 com.apple.Safari 的串直接当 bundleID。
+func candidateBundleID(_ q: String) -> String? {
+    if q.contains("/") { return Bundle(url: URL(fileURLWithPath: q))?.bundleIdentifier }
+    if q.contains("."), !q.contains(" ") { return q }
+    return nil
+}
+
 /// 按 bundle id / 路径 / 名称解析；未运行则按 bundle id 或路径拉起。
-func resolveApp(_ query: String) throws -> AppRef {
+///
+/// 应用策略（白/黑名单）在这里判定。早期是在 dispatch 里另查一遍，而那版
+/// 为了拿到 bundleID 调用了本函数——本函数会拉起未运行的应用，于是
+/// 「禁止操作某个应用」实际变成了「先把它启动再拒绝」。现在解析到即校验，
+/// 需要拉起时先用 candidateBundleID 预检，预检不过就不启动。
+///
+/// - Parameters:
+///   - launch: 未运行是否拉起。策略预检、历史记录这类只要身份的场景传 false。
+///   - enforcePolicy: 是否应用白/黑名单。
+func resolveApp(_ query: String, launch: Bool = true, enforcePolicy: Bool = true) throws -> AppRef {
     let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !q.isEmpty else { throw CUAError.badRequest("app is required") }
 
+    func accept(_ app: NSRunningApplication) throws -> AppRef {
+        let ref = describe(app)
+        if enforcePolicy, let reason = policyDecision(for: ref) {
+            throw CUAError.badRequest(reason)
+        }
+        return ref
+    }
+
     let apps = allApps()
 
-    if let a = apps.first(where: { $0.bundleIdentifier == q }) { return describe(a) }
-    if let a = apps.first(where: { $0.bundleURL?.path == q }) { return describe(a) }
+    if let a = apps.first(where: { $0.bundleIdentifier == q }) { return try accept(a) }
+    if let a = apps.first(where: { $0.bundleURL?.path == q }) { return try accept(a) }
 
     let lower = q.lowercased()
     let byName = apps.filter {
         ($0.localizedName ?? "").lowercased() == lower
             || ($0.bundleURL?.deletingPathExtension().lastPathComponent ?? "").lowercased() == lower
     }
-    if byName.count == 1 { return describe(byName[0]) }
+    if byName.count == 1 { return try accept(byName[0]) }
     if byName.count > 1 {
         throw CUAError.ambiguous(q + " 匹配到多个应用: " + byName.compactMap { $0.bundleIdentifier }.joined(separator: ", "))
     }
     let fuzzy = apps.filter { ($0.localizedName ?? "").lowercased().contains(lower) }
-    if fuzzy.count == 1 { return describe(fuzzy[0]) }
+    if fuzzy.count == 1 { return try accept(fuzzy[0]) }
 
     // 上面只查了 activationPolicy == .regular 的应用。
     // 菜单栏应用（ClashX、Tailscale、Spotlight 这类）是 .accessory，
     // 明明在跑却被当成「未运行」，于是走拉起流程白等近一秒。
     // 先在全量运行应用里按 bundleID / 名称再找一次。
     let live = NSWorkspace.shared.runningApplications
-    if let a = live.first(where: { $0.bundleIdentifier == q }) { return describe(a) }
+    if let a = live.first(where: { $0.bundleIdentifier == q }) { return try accept(a) }
     if let a = live.first(where: {
         ($0.localizedName ?? "").lowercased() == lower
             || ($0.bundleURL?.deletingPathExtension().lastPathComponent ?? "").lowercased() == lower
     }) {
-        return describe(a)
+        return try accept(a)
     }
 
-    // 确实未运行：尝试拉起
+    // 确实未运行。拉起之前先过策略：能从查询串推断出 bundleID 时，
+    // 被禁的应用一律不启动。
+    if enforcePolicy, let bid = candidateBundleID(q) {
+        if let reason = policyDecision(for: AppRef(pid: 0, bundleID: bid, name: bid, path: q)) {
+            throw CUAError.badRequest(reason)
+        }
+    }
+    guard launch else { throw CUAError.appNotFound(q) }
+
     if q.contains("/") {
         let url = URL(fileURLWithPath: q)
         let cfg = NSWorkspace.OpenConfiguration()
@@ -577,7 +613,7 @@ func resolveApp(_ query: String) throws -> AppRef {
         _ = sem.wait(timeout: .now() + 15)
         if let app = launched {
             Thread.sleep(forTimeInterval: 0.8)
-            return describe(app)
+            return try accept(app)
         }
     }
     if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: q) {
@@ -592,7 +628,7 @@ func resolveApp(_ query: String) throws -> AppRef {
         _ = sem.wait(timeout: .now() + 15)
         if let app = launched {
             Thread.sleep(forTimeInterval: 0.8)
-            return describe(app)
+            return try accept(app)
         }
     }
     throw CUAError.appNotFound(q)
@@ -644,8 +680,11 @@ func captureTree(pid: pid_t, appName: String, diffMode: String = "none") -> Snap
     struct Frame { let el: AXUIElement; let depth: Int; let path: String; let roleIndex: Int }
     var stack: [Frame] = [Frame(el: start, depth: 0, path: "", roleIndex: 0)]
 
+    // 配置在整棵树里不变，取一次就够。原来写在校验里，每访问一个节点都要
+    // stat 一次配置文件（4000 节点 = 4000 次 attributesOfItem），纯浪费。
+    let cap = CuaConfig.current().maxElements
+
     while let f = stack.popLast() {
-        let cap = CuaConfig.current().maxElements
         if visited >= cap { lines.append("... (达到节点上限 \(cap)，已截断)"); break }
         if f.depth > maxDepth { continue }
         visited += 1
@@ -1019,42 +1058,6 @@ func hamming(_ a: UInt64, _ b: UInt64) -> Int {
 
 // MARK: - 截图
 
-func captureWindowImage(pid: pid_t, windowID: CGWindowID, maxDim: Int, quality: Double) throws -> Data {
-    let sem = DispatchSemaphore(value: 0)
-    var out: Data?
-    var failure: Error?
-
-    Task {
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let win = content.windows.first(where: { $0.windowID == windowID }) else {
-                throw CUAError.captureFailed("找不到 windowID \(windowID)")
-            }
-            let filter = SCContentFilter(desktopIndependentWindow: win)
-
-            let cfg = SCStreamConfiguration()
-            let scale = CGFloat(filter.pointPixelScale)
-            let w = max(1, Int(filter.contentRect.width * scale))
-            let h = max(1, Int(filter.contentRect.height * scale))
-            let factor = min(1.0, Double(maxDim) / Double(max(w, h)))
-            cfg.width = max(1, Int(Double(w) * factor))
-            cfg.height = max(1, Int(Double(h) * factor))
-            cfg.showsCursor = false
-            cfg.capturesAudio = false
-            cfg.pixelFormat = kCVPixelFormatType_32BGRA
-
-            let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
-            out = encodeJPEG(img, quality: quality)
-        } catch {
-            failure = error
-        }
-        sem.signal()
-    }
-    _ = sem.wait(timeout: .now() + 30)
-    if let d = out { return d }
-    throw CUAError.captureFailed(failure?.localizedDescription ?? "截图超时")
-}
-
 /// 截图并同时返回画面指纹，供调用方判断要不要真的把图发出去。
 func captureWindowFrame(pid: pid_t, windowID: CGWindowID, maxDim: Int, quality: Double) throws -> (data: Data, sig: FrameSignature) {
     let sem = DispatchSemaphore(value: 0)
@@ -1205,13 +1208,10 @@ private func focusedSignature(_ appEl: AXUIElement) -> String {
     guard let f = attr(appEl, kAXFocusedUIElementAttribute as String),
           CFGetTypeID(f) == AXUIElementGetTypeID() else { return "" }
     let el = f as! AXUIElement
-    var pid: pid_t = 0
-    var id: CFTypeRef?
     // 元素身份用 AXIdentifier + role + 值的组合近似
     let ident = strAttr(el, "AXIdentifier") ?? ""
     let role = strAttr(el, kAXRoleAttribute as String) ?? ""
     let val = strAttr(el, kAXValueAttribute as String) ?? ""
-    _ = pid; _ = id
     return "\(ident)|\(role)|\(val)"
 }
 
@@ -1523,9 +1523,11 @@ enum Overlay {
 // 早期实现只有一张硬编码的 US 布局表，AZERTY / QWERTZ 下按键会全错位。
 // 现在：命名键（return/tab/方向键…）仍走静态表，可打印字符按布局实时反查。
 
-private var layoutKeyCache: [Character: CGKeyCode] = [:]
+/// 解析出的键码，以及该字符在当前布局下是否需要按 shift。
+/// 只返回键码是不够的：`?` 在 US 布局里是 shift+/，不补 shift 就会打出 `/`。
+private var layoutKeyCache: [Character: (code: CGKeyCode, shift: Bool)] = [:]
 
-func keyCodeForCharacter(_ ch: Character) -> CGKeyCode? {
+func keyCodeForCharacter(_ ch: Character) -> (code: CGKeyCode, shift: Bool)? {
     if let cached = layoutKeyCache[ch] { return cached }
     guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
           let prop = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
@@ -1548,9 +1550,9 @@ func keyCodeForCharacter(_ ch: Character) -> CGKeyCode? {
             )
             deadKeyState = 0
             if status == noErr, length > 0, Array(chars[0..<length]) == want {
-                let kc = CGKeyCode(code)
-                layoutKeyCache[ch] = kc
-                return kc
+                let hit = (code: CGKeyCode(code), shift: shifted)
+                layoutKeyCache[ch] = hit
+                return hit
             }
         }
     }
@@ -1651,22 +1653,29 @@ func modifierMask(_ name: String) -> CGEventFlags? {
 }
 
 func postKey(pid: pid_t, key: String) throws {
-    let tokens = key.lowercased().split(separator: "+").map(String.init)
-    guard let last = tokens.last else { throw CUAError.badRequest("按键为空") }
+    // 不能把整串 lowercased 之后再解析：那会把 "A" 降级成 "a"，
+    // 也让 "?" 这类靠 shift 打出来的符号彻底失去语义。
+    // 命名键查表时才转小写，单字符按原样交给布局反查。
+    let tokens = key.split(separator: "+").map(String.init)
+    guard let last = tokens.last, !last.isEmpty else { throw CUAError.badRequest("按键为空") }
     // 命名键走静态表；单个可打印字符按当前布局反查
     let code: CGKeyCode
-    if let named = keyCodes[last] {
+    var needsShift = false
+    if let named = keyCodes[last.lowercased()] {
         code = named
-    } else if last.count == 1, let ch = last.first, let resolved = keyCodeForCharacter(ch) {
-        code = resolved
+    } else if last.count == 1, let ch = last.first, let hit = keyCodeForCharacter(ch) {
+        // 布局反查命中 shifted 分支时必须补上 shift，否则 "?" 打成 "/"
+        code = hit.code
+        needsShift = hit.shift
     } else {
         throw CUAError.badRequest("无法识别的按键: \(key)（当前布局下找不到对应键码）")
     }
     var flags: CGEventFlags = []
     for m in tokens.dropLast() {
-        guard let f = modifierMask(m) else { throw CUAError.badRequest("无法识别的修饰键: \(m)") }
+        guard let f = modifierMask(m.lowercased()) else { throw CUAError.badRequest("无法识别的修饰键: \(m)") }
         flags.insert(f)
     }
+    if needsShift { flags.insert(.maskShift) }
     guard let src = CGEventSource(stateID: .hidSystemState) else {
         throw CUAError.eventFailed("无法创建事件源")
     }
@@ -1687,7 +1696,11 @@ func typeText(pid: pid_t, text: String) throws {
     let units = Array(text.utf16)
     var i = 0
     while i < units.count {
-        let chunk = Array(units[i..<min(i + 20, units.count)])
+        var end = min(i + 20, units.count)
+        // 别把代理对切成两半：切点前一个是高位代理（D800–DBFF）且后面还有内容时退一格。
+        // 切开了就是两个孤立代理，注入出去是乱码（emoji 尤其明显）。
+        if end < units.count, units[end - 1] >= 0xD800, units[end - 1] <= 0xDBFF { end -= 1 }
+        let chunk = Array(units[i..<end])
         guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
             throw CUAError.eventFailed("文本事件创建失败")
@@ -1817,6 +1830,9 @@ func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) thr
                               wheelCount: 2, wheel1: d1, wheel2: d2, wheel3: 0) else { return }
         e.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase))
         e.setIntegerValueField(.scrollWheelEventScrollCount, value: 1)
+        // 事件落在哪个子视图由 location 决定。不设就是「真实光标的当前位置」，
+        // 多分栏界面会滚到用户鼠标下的那一栏，而不是要滚的那栏。
+        if let p = point { e.location = p }
         e.postToPid(pid)
     }
 
@@ -2263,7 +2279,14 @@ func toolOpenApp(_ args: [String: Any]) throws -> [[String: Any]] {
     // 需要真前置（例如紧接着要点击）时由调用方显式传 activate: true。
     let activate = (args["activate"] as? Bool) ?? false
 
-    var ref = try? resolveApp(q)
+    // 不能写成 try?：策略拒绝是以 CUAError 抛出的，吞成 nil 之后会掉进
+    // 下面的「自己拉起」分支，把被禁的应用照样打开。只放行「找不到」这一种。
+    var ref: AppRef?
+    do {
+        ref = try resolveApp(q)
+    } catch let e as CUAError {
+        if case .appNotFound = e { ref = nil } else { throw e }
+    }
     if ref == nil {
         // 未运行：按路径或 bundleID 拉起
         guard q.contains("/") || q.contains(".") else {
@@ -2272,6 +2295,12 @@ func toolOpenApp(_ args: [String: Any]) throws -> [[String: Any]] {
         let url = q.contains("/") ? URL(fileURLWithPath: q)
                                   : (NSWorkspace.shared.urlForApplication(withBundleIdentifier: q)
                                      ?? URL(fileURLWithPath: "/Applications/\(q).app"))
+        // 这条路径跳过了 resolveApp 的策略判定，必须自己补一次，
+        // 否则白/黑名单对 open_app 无效。
+        let bid = candidateBundleID(q) ?? Bundle(url: url)?.bundleIdentifier ?? ""
+        if let reason = policyDecision(for: AppRef(pid: 0, bundleID: bid, name: q, path: url.path)) {
+            throw CUAError.badRequest(reason)
+        }
         let cfg = NSWorkspace.OpenConfiguration()
         cfg.activates = activate
         let sem = DispatchSemaphore(value: 0)
@@ -2517,7 +2546,14 @@ func toolClick(_ args: [String: Any]) throws -> [[String: Any]] {
         // 优先走 AXPress：鼠标事件即使定向投递到 pid，被点的应用也会
         // 当成真实点击、自己把窗口激活上来，用户焦点照样被抢。
         // AXPress 是纯 AX 动作，不经过事件系统，窗口不会被升起。
-        if actionNames(of: el).contains(kAXPressAction as String),
+        //
+        // 但只对「左键单击」成立。AXPress 没有右键/多击语义：
+        // 早期不判断 button 和 count，右键点在支持 AXPress 的元素上会变成
+        // 一次左键单击，右键菜单永远出不来；双击也被压成单击。
+        // 这两种情况必须走真实事件路径。
+        let axPressEligible = button == 0 && count <= 1
+        if axPressEligible,
+           actionNames(of: el).contains(kAXPressAction as String),
            AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
             // 光标要跟到元素位置：AXPress 不经过事件系统，
             // 若不主动移动，屏幕上看到的是「AI 说点了但光标没动」。
@@ -2612,20 +2648,22 @@ func toolSelectText(_ args: [String: Any]) throws -> [[String: Any]] {
         throw CUAError.axFailed("元素 [\(id)] 没有可读的 value，无法选择文本")
     }
     let target = (args["text"] as? String) ?? full
-    guard let range = full.range(of: target) else {
+    // AXSelectedTextRange 吃的是 UTF-16 偏移，不是 Character 偏移。
+    // 用 String.distance 算，含 emoji 这类非 BMP 字符的文本会整体错位。
+    let ns = full as NSString
+    let hit = ns.range(of: target)
+    guard hit.location != NSNotFound else {
         throw CUAError.badRequest("元素文本中找不到目标子串")
     }
-    let start = full.distance(from: full.startIndex, to: range.lowerBound)
-    let len = full.distance(from: range.lowerBound, to: range.upperBound)
 
-    var cfRange = CFRange(location: start, length: len)
+    var cfRange = CFRange(location: hit.location, length: hit.length)
     guard let axVal = AXValueCreate(.cfRange, &cfRange) else {
         throw CUAError.axFailed("AXValue 创建失败")
     }
     let r = AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, axVal)
     guard r == .success else { throw CUAError.axFailed("设置选区返回 \(r.rawValue)") }
     waitForChange(pid: ref.pid)
-    return [["type": "text", "text": "已在元素 [\(id)] 选中 \(len) 个字符（偏移 \(start)）"]]
+    return [["type": "text", "text": "已在元素 [\(id)] 选中 \(hit.length) 个字符（偏移 \(hit.location)）"]]
 }
 
 func toolPaste(_ args: [String: Any]) throws -> [[String: Any]] {
@@ -2817,6 +2855,26 @@ func errorResponse(_ id: Any?, _ code: Int, _ message: String) -> [String: Any] 
     ["jsonrpc": "2.0", "id": id ?? NSNull(), "error": ["code": code, "message": message]]
 }
 
+/// 历史里记哪个应用名。
+/// 必须是解析后的 bundleID：ignoredBundleIDs 按 bundleID 匹配，memory.md 也按它聚合。
+/// 记模型输入的原始串（"Safari"、一条路径）两边都对不上，同一应用还会被拆成好几条。
+/// 解析失败（应用不存在、被策略拒绝）就退回原始串，至少不丢信息。
+func historyAppKey(_ args: [String: Any]) -> String? {
+    guard let q = args["app"] as? String, !q.isEmpty else { return nil }
+    return (try? resolveApp(q, launch: false, enforcePolicy: false))?.bundleID ?? q
+}
+
+/// 失败的调用也要进历史。原来只有成功路径写 events.jsonl，
+/// 失败的从没落过盘，`status` 字段恒为 completed——
+/// 「哪些操作老是失败」在历史里完全看不出来。
+func recordFailure(_ method: String, _ params: [String: Any]) {
+    guard method == "tools/call",
+          let name = params["name"] as? String, name != "history" else { return }
+    let args = (params["arguments"] as? [String: Any]) ?? [:]
+    History.record(tool: name, args: args, app: historyAppKey(args),
+                   status: "failed", ms: 0)
+}
+
 func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
     if ProcessInfo.processInfo.environment["CUA_DEBUG_RPC"] != nil, method == "tools/call" {
         let keys = params.keys.sorted().joined(separator: ",")
@@ -2852,15 +2910,19 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
             currentSessionID = env
         }
         let args = (params["arguments"] as? [String: Any]) ?? [:]
-        // 锁屏时所有依赖 AX / 截屏 / 注入的工具都会失败，先给准确原因
-        if isScreenLocked(), name != "list_apps", name != "screen_state", name != "unlock_screen" {
+        // 锁屏时依赖 AX / 截屏 / 输入注入的工具都会失败，先给准确原因。
+        // 但不该一刀切：history 是纯文件 IO，browser_* 走 CDP 网络，
+        // 锁屏跟它们无关——早先连「看看历史」都被拒了。
+        let lockSafe: Set<String> = [
+            "list_apps", "screen_state", "unlock_screen", "history",
+            "browser_tabs", "browser_eval", "browser_screenshot", "browser_open",
+        ]
+        if isScreenLocked(), !lockSafe.contains(name) {
             throw CUAError.badRequest("屏幕已锁定（loginwindow 接管）。AX 读取、截屏与输入投递都不可用，可用 unlock_screen 唤醒解锁。")
         }
-        // 应用策略：带 app 参数的工具在落到目标之前先过白/黑名单
-        if let appQuery = args["app"] as? String, let target = try? resolveApp(appQuery),
-           let reason = policyDecision(for: target) {
-            throw CUAError.badRequest(reason)
-        }
+        // 应用策略（白/黑名单）由 resolveApp 在解析到的当场判定，这里不再重复查。
+        // 旧版在这里调 resolveApp 拿 bundleID，而它会拉起未运行的应用，
+        // 于是「禁止某个应用」变成了「先启动再拒绝」。
         let content: [[String: Any]]
         switch name {
         case "list_apps": content = try toolListApps(args)
@@ -2890,8 +2952,8 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
         let elapsed = Int(Date().timeIntervalSince(callStart) * 1000)
         // history 自身不入账，否则查看历史这个动作本身会污染历史
         if name != "history" {
-            History.record(tool: name, args: args,
-                           app: (args["app"] as? String), status: "completed", ms: elapsed)
+            History.record(tool: name, args: args, app: historyAppKey(args),
+                           status: "completed", ms: elapsed)
         }
         return ["content": content, "isError": false]
     default:
@@ -3012,11 +3074,13 @@ func handleLine(_ line: String) {
             send(["jsonrpc": "2.0", "id": id,
                   "result": ["content": [["type": "text", "text": e.description]], "isError": true]])
         }
+        if id != nil { recordFailure(method, params) }
     } catch {
         if let id = id {
             send(["jsonrpc": "2.0", "id": id,
                   "result": ["content": [["type": "text", "text": "内部错误: \(error)"]], "isError": true]])
         }
+        if id != nil { recordFailure(method, params) }
     }
 }
 
@@ -3026,11 +3090,14 @@ let stdinSource = DispatchSource.makeReadSource(fileDescriptor: 0, queue: .main)
 stdinSource.setEventHandler {
     var chunk = [UInt8](repeating: 0, count: 65536)
     let n = read(0, &chunk, chunk.count)
-    guard n > 0 else {
+    if n == 0 {
         // stdin 关闭：父进程走了，正常收尾
         stdinSource.cancel()
         exit(0)
     }
+    // read 被信号打断时返回 -1（EINTR），那不是 EOF。原来一律当 EOF 处理，
+    // 一个无关信号就能让整个 MCP 服务器静默退出。等下次可读再继续。
+    guard n > 0 else { return }
     stdinBuffer.append(contentsOf: chunk[0..<n])
     while let nl = stdinBuffer.firstIndex(of: 0x0A) {
         let lineData = stdinBuffer[stdinBuffer.startIndex..<nl]

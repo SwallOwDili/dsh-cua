@@ -24,6 +24,8 @@ export class McpBridge extends EventEmitter {
   #pending = new Map()
   #closed = false
   #starting = null
+  /** 子进程是否已完成 MCP 握手。进程活着 ≠ 握过手，两者要分开记。 */
+  #initialized = false
 
   constructor(binary, options = {}) {
     super()
@@ -49,6 +51,7 @@ export class McpBridge extends EventEmitter {
     // Node 会把它升级成未捕获异常，直接带走宿主进程。
     this.#child.stdin.on('error', (error) => {
       this.#closed = true
+      this.#initialized = false
       // 同样要清引用，否则下一次 ensureReady 会因为 start() 里的
       // “已存在 child”提前返回，再也不重新拉起。
       this.#child = undefined
@@ -62,6 +65,7 @@ export class McpBridge extends EventEmitter {
 
     this.#child.on('exit', (code, signal) => {
       this.#closed = true
+      this.#initialized = false
       // 必须清掉引用。否则 ensureReady 里 start() 会因为
       // “已经有一个 child”直接返回，永远不重新 spawn，
       // 而每次调用都会挂到 180 秒超时——全部工具瘫痪到宿主重启。
@@ -76,6 +80,7 @@ export class McpBridge extends EventEmitter {
 
     this.#child.on('error', (error) => {
       this.#closed = true
+      this.#initialized = false
       this.#child = undefined
       this.emit('error', error)
     })
@@ -84,6 +89,7 @@ export class McpBridge extends EventEmitter {
   stop() {
     if (!this.#child) return
     this.#closed = true
+    this.#initialized = false
     try {
       this.#child.stdin.end()
       this.#child.kill()
@@ -152,11 +158,16 @@ export class McpBridge extends EventEmitter {
   }
 
   /**
-   * 保证子进程活着。二进制被重新构建后，旧进程跑的还是旧代码，
-   * 而它是常驻的、不会自己换新——所以调用前兜底重启一次。
+   * 保证子进程活着**并且**已握手。
+   *
+   * 只判 isRunning 是不够的：调用方先 start() 再 initialize() 时，
+   * 进程已经在跑但握手还没完成，ensureReady 会误判成就绪；
+   * 反过来进程活着但握手失败时，也永远不会重试。
+   * 二进制被重新构建后，旧进程跑的还是旧代码，而它是常驻的、
+   * 不会自己换新——所以调用前兜底重启一次。
    */
   async ensureReady() {
-    if (this.isRunning) return
+    if (this.isRunning && this.#initialized) return
     // 并发调用只允许一个 initialize。MCP 规定握手一次，
     // 两个会话同时发起工具调用时重复握手会让子进程状态错乱。
     if (!this.#starting) {
@@ -184,6 +195,7 @@ export class McpBridge extends EventEmitter {
       clientInfo: { name: 'dsh-cua', version: '1.12.0' },
     })
     this.#send({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
+    this.#initialized = true
   }
 
   async listTools() {
