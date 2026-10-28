@@ -8,8 +8,17 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION=$(node -p "require('./package.json').version")
-NAME="dsh-cua-${VERSION}-macos-universal"
-OUT="dist/${NAME}.tar.gz"
+# 资产名与包内顶层目录都不带版本号，是有意的。
+# README 的安装命令用的是 releases/latest/download/<name>：latest 永远指向
+# 最新一个已发布 release，而每版 release 里放的都是同一个资产名——于是这条
+# 命令永久有效，不需要发版时改 README 里的版本号。
+# 版本号曾经嵌在名字里（dsh-cua-1.14.0-macos-universal.tar.gz），后果是
+# latest 指向 1.15.0 之后，那条命令去 1.15.0 的 release 里找 1.14.0 的文件，
+# 直接 404。而且包内顶层目录带版本号时，README 里写的「解压出 dsh-cua/」
+# 和后面的 cp -R dsh-cua 也全都是错的。
+# 回溯旧版靠 tag：每个 release 各自带一份同名资产，指定 tag 下载即可。
+NAME="dsh-cua"
+OUT="dist/dsh-cua-macos-universal.tar.gz"
 
 mkdir -p dist
 rm -rf "dist/${NAME}" "$OUT"

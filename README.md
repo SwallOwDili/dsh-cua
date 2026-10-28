@@ -34,7 +34,7 @@ Elements: 122
 一条命令，不需要 clone，不需要 Xcode：
 
 ```bash
-curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-1.14.0-macos-universal.tar.gz | tar xz
+curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-macos-universal.tar.gz | tar xz
 ```
 
 解压出 `dsh-cua/`，里面的 `bin/` 已经是 arm64 + x86_64 通用二进制。
