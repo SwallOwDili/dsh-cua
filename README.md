@@ -1,35 +1,65 @@
+<div align="center">
+
 # dsh-cua
 
-macOS 桌面操作助手：让 AI 直接看见并操作你屏幕上的应用。
+**让 AI 直接操作你 Mac 上的应用**
 
-它把每个正在运行的应用翻译成一份结构化清单——界面上每一个按钮、输入框、列表项，
-连同它们的层级、标题、当前值、可执行动作一起摊平，AI 据此决定点哪里、输入什么、
-操作有没有生效。不需要辅助窗口，不接管你的鼠标键盘。
+<p>
+  <img src="https://img.shields.io/badge/macOS-14%2B-3b82f6?style=for-the-badge" alt="macOS 14+" />
+  <img src="https://img.shields.io/badge/arch-arm64%20%7C%20x86_64-3b82f6?style=for-the-badge" alt="架构" />
+  <img src="https://img.shields.io/badge/license-MIT-3b82f6?style=for-the-badge" alt="MIT" />
+</p>
 
+<p>
+  <b>dsh</b> 插件 · <b>独立 MCP</b> · <b>实时画面</b> · <b>不抢焦点</b>
+</p>
+
+</div>
+
+---
+
+**让 AI 真正上手操作你的 Mac，而不只是回答你。**
+
+「把这个文件拖进访达」「帮我在备忘录记一笔」——它自己看懂窗口、自己点、自己打字，**全程就在你眼前做完**。
+
+## ✨ 它长什么样
+
+- 📺 **实时画面** —— 被操作的应用在对话右上角出现小窗，可点击跳转；多窗口叠在一起，点角上序号切换。
+- 🎯 **目标标记** —— 屏幕上的目标控件被短暂标出，让你知道它下一步点哪里。
+- 🖥️ **不抢焦点** —— 后台窗口也能打字、点按钮，你继续敲你的字，它在后台干活。
+
+## 🚀 快速开始
+
+### 1. 安装
+
+```bash
+dsh plugin --profile web add github:SwallOwDili/dsh-cua
 ```
-App: 访达 (pid 476)
-Focused: [90] AXList <AXCollectionList> desc="图标视图" (focused) actions=[AXShowMenu]
-Elements: 122
-[1] AXWindow <AXStandardWindow> "dist" actions=[AXRaise]
-  [2] AXSplitGroup
-    [3] AXScrollArea actions=[AXScrollLeftByPage,AXScrollRightByPage]
-      [4] AXOutline desc="边栏"
-```
 
-一行一个元素，前面是带编号的 ID。AI 按 ID 定位，不猜坐标。界面没变时 ID 跨快照稳定；
-界面重排时 ID 会变，操作前先刷新一次 `get_app_state` 即可。
+> [!NOTE]
+> 没有 dsh？见下方[「独立使用」](#独立使用不用-dsh)。想要预编译包或源码，见[「安装」](#安装)。
 
-## 能做什么
+### 2. 授权
 
-- **读界面**：把应用的可交互元素连层级一起摊平，标注标题、值、状态、可用动作。
-- **操作**：点击、输入、按键、滚动、拖拽、改值、选中文本，直接作用于目标应用。
-- **不抢焦点**：给后台窗口打字、点按钮，不会打断你正在做的事；滚动受限时会明确说明，不会擅自把窗口拽到前台。
-- **省 token**：默认只返回有变化的部分。截图按需附带——默认只在画面确实变了才附一张；不要图可传 `screenshot: never`。
-- **实时画面**：正在被操作的应用，在对话右上角出现一个小窗，可点击跳转；同时操作多个窗口时叠在一起，点角上的序号切换。
-- **历史**：可选的本地操作记录，敏感字段自动脱敏，附一份记忆文件供后续参考。
-- **浏览器**：可接管已登录的 Chrome，在后台开标签、执行脚本、截图，不干扰你正在用的窗口。
+打开「系统设置 → 隐私与安全性」，给承载进程（终端或 DSH Desktop）勾上两项：
 
-## 安装
+| 权限 | 作用 | 缺了会怎样 |
+|---|---|---|
+| **辅助功能** | 读界面、点元素 | 所有操作都无法执行 |
+| **屏幕录制** | 截图 | 只是看不到画面，操作不受影响 |
+
+### 3. 重启 dsh，开始用
+
+重启后工具自动生效，直接在对话里让 AI 操作你的应用即可。
+
+## 💡 能做什么
+
+- 🖥️ **操作你的应用** —— 点击、输入、按键、滚动、拖拽、改值、选中文本，都是真操作。
+- 👁️ **看懂界面** —— 自动识别窗口里的按钮、输入框、列表项，不靠瞎点坐标。
+- 🌐 **接管浏览器** —— 用你已登录的 Chrome，后台开标签、执行脚本、截图，不干扰你正在用的窗口。
+- 📜 **操作历史** —— 可选，本地记录每一步，敏感字段自动脱敏。
+
+## 📥 安装
 
 拿到 `dsh-cua/` 目录，两种方式任选：
 
@@ -41,54 +71,43 @@ curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-
 git clone https://github.com/SwallowDili/dsh-cua.git
 ```
 
-解压/克隆出的 `dsh-cua/` 里，`bin/` 是 arm64 + x86_64 通用二进制。下文所有命令里的
-`<解压目录>` 都指这个路径。
+解压/克隆出的 `dsh-cua/` 里，`bin/` 是 arm64 + x86_64 通用二进制。需要 macOS 14+。
 
-需要 macOS 14+。
-
-## 使用方式
-
-两种用法，按需选一种：
+## 🔌 使用方式
 
 ### 作为 dsh 插件（推荐）
-
-一条命令，直接装到 dsh profile：
 
 ```bash
 dsh plugin --profile web add github:SwallOwDili/dsh-cua
 ```
 
-`--profile web` 是目标 profile（默认就是 `web`，可省略）。`dsh plugin add` 转发给
-该 profile 目录下的 pnpm，`github:` 前缀会从 GitHub 拉取仓库装进
-`~/.dsh/profiles/<profile>/node_modules/dsh-cua`，不需要手动 clone。
+`--profile web` 是目标 profile（默认就是 `web`，可省略）。装好后重启 dsh，
+工具自动出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
 
-也可以先拿到目录再拷贝（例如自己 clone 源码开发时）：
+自己 clone 源码开发时，也可以直接拷贝目录：
 
 ```bash
 cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 ```
 
-这个位置不能换——插件依赖 dsh 提供的 `schemastery`，只有放在 profile 的
-`node_modules` 下才解析得到。
+> [!WARNING]
+> 这个位置不能换——插件依赖 dsh 提供的 `schemastery`，只有放在 profile 的
+> `node_modules` 下才解析得到。
 
-重启 dsh 后，工具自动出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
-走插件链路时，操作会自动归属到当前会话，实时画面小窗只出现在对应的对话里。
+### 独立使用（不用 dsh）
 
-### 作为独立 MCP 服务器
-
-不用 dsh，任何 MCP 客户端直接指向二进制即可：
+任何 MCP 客户端都能直接指向二进制：
 
 ```bash
 <解压目录>/bin/cua-mcp
 ```
 
-它是个标准 stdio MCP 服务器，跟 dsh 没有耦合，不需要额外的运行环境。
+它是一个标准 stdio MCP 服务器，跟 dsh 没有耦合，不需要额外运行环境。
+把二进制的绝对路径（在解压目录执行 `echo "$(pwd)/bin/cua-mcp"` 可得）填进
+MCP 客户端的 `command` 即可。
 
-把二进制的绝对路径填进 MCP 客户端的 `command` 即可。在解压目录里执行
-`echo "$(pwd)/bin/cua-mcp"` 拿到绝对路径。装了 dsh 插件、想用 profile 里那份的话，
-路径是 `~/.dsh/profiles/<profile>/node_modules/dsh-cua/bin/cua-mcp`。
-
-OpenCode 的接法：
+<details>
+<summary>OpenCode 接法</summary>
 
 ```json
 {
@@ -106,19 +125,72 @@ OpenCode 的接法：
 ```
 
 `timeout` 建议调大，默认 30 秒会把正常操作腰斩。`CUA_SESSION` 声明这次操作归属哪个会话——
-设了它，实时画面小窗才会出现在对应对话里；不设也能正常操作，只是不会显示预览。
+设了它，实时画面小窗才会出现在对应对话里；不设也能正常操作，只是不显示预览。
 
-## 授权
+</details>
 
-首次使用前，给承载进程（终端或 DSH Desktop）两项系统权限：
+## ⚙️ 配置
 
-- **辅助功能**：读界面、点元素。没有它所有工具都会失败。
-- **屏幕录制**：截图。没有它截图不可用，其余功能正常。
+在 dsh 设置页调整（`~/.dsh/dsh-cua.config.json` 是插件写出的产物，手改会在下次启动被覆盖）：
 
-在「系统设置 → 隐私与安全性」里勾选后重启宿主进程。插件启动时会自检并明确报出缺哪一项。
-从哪个终端启动客户端，就给那个终端勾选这两项权限。
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `overlayEnabled` | `true` | 操作时在屏幕上标出目标 |
+| `livePreviewEnabled` | `true` | 对话页右上角的实时画面小窗 |
+| `overlayTtlSeconds` | `20` | 目标标记停留时长 |
+| `scrollStepPx` | `40` | 滚动步长 |
+| `maxElements` | `4000` | 单次返回的界面元素上限 |
+| `syntheticActivate` | `true` | 让目标自认为前台（不夺走你的焦点） |
+| `approvalMode` | `off` | 写操作前确认：`off` / `once-per-app` / `always` |
+| `historyEnabled` | `true` | 记录操作历史 |
+| `deniedBundleIDs` | `[]` | 禁止操作的应用 |
+| `allowedBundleIDs` | `[]` | 允许列表，非空时只允许这些 |
+| `browserCdpPort` | `0` | 接管浏览器时用的调试端口，`0` 为自动 |
 
-## 工具
+## ⚠️ 使用须知
+
+- **滚动**：目标在后台时不接受进程内滚轮的应用（如访达的列表），会如实报「内容没有移动」。需要前台滚动时先把窗口切到前面。点击和输入没有这个限制。
+- **拖拽**：需要让目标窗口前置，这是部分 Catalyst 应用的要求。
+- **锁屏**：`unlock_screen` 需要系统密码，只在明确调用时使用，不保存密码。
+- **多会话并行**：多个客户端共用同一个实时画面服务，目标按会话分流，互不可见。
+- **实时画面不出本机**：预览只绑 `127.0.0.1`，同网段访问不到；画面直接由本机进程推送，不经过任何外部服务。
+
+<details>
+<summary>打开未运行的应用的定位规则</summary>
+
+`open_app` 按「英文文件名 / bundle id / 完整路径」定位，会在标准应用目录
+（`/Applications`、`/System/Applications` 等）按文件名搜索。
+
+两个例外：
+
+- 系统应用的中文显示名（如「计算器」）是系统级本地化、不存进应用包，按中文名找不到；
+- 受 Cryptexes 保护的系统应用（如 Safari）不在可遍历目录里，按文件名也找不到。
+
+这两种情况请用 bundle id（如 `com.apple.calculator`、`com.apple.Safari`）。
+
+</details>
+
+## 🧠 工作原理与工具（给接入方）
+
+`dsh-cua` 通过 macOS 的辅助功能接口读取应用的**无障碍树**——把界面上每一个按钮、
+输入框、列表项，连同它们的层级、标题、当前值、可执行动作摊平成一份结构化清单。
+AI 据此决定点哪里、输入什么、操作有没有生效，而不是靠猜坐标。
+
+```
+App: 访达 (pid 476)
+Focused: [90] AXList <AXCollectionList> desc="图标视图" (focused) actions=[AXShowMenu]
+Elements: 122
+[1] AXWindow <AXStandardWindow> "dist" actions=[AXRaise]
+  [2] AXSplitGroup
+    [3] AXScrollArea actions=[AXScrollLeftByPage,AXScrollRightByPage]
+      [4] AXOutline desc="边栏"
+```
+
+一行一个元素，前面是带编号的 ID。界面没变时 ID 跨快照稳定；界面重排时 ID 会变，
+操作前先刷新一次 `get_app_state` 即可。
+
+为省 token，默认只返回有变化的部分；截图按需附带——默认只在画面确实变了才附一张，
+不要图可传 `screenshot: never`。
 
 | 工具 | 作用 |
 |---|---|
@@ -142,36 +214,6 @@ OpenCode 的接法：
 | `browser_screenshot` | 截取页面 |
 | `history` | 读操作历史、写记忆文件、开关记录 |
 
-## 配置
+## 📄 许可
 
-在 dsh 设置页调整。`~/.dsh/dsh-cua.config.json` 是插件写出的产物，手改会在下次启动被设置页覆盖：
-
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `overlayEnabled` | `true` | 操作时在屏幕上标出目标 |
-| `livePreviewEnabled` | `true` | 对话页右上角的实时画面小窗，与上一条互不影响 |
-| `overlayTtlSeconds` | `20` | 标记停留时长 |
-| `scrollStepPx` | `40` | 滚动步长 |
-| `maxElements` | `4000` | 单次返回的元素上限 |
-| `syntheticActivate` | `true` | 让目标自认为前台（不夺走你的焦点） |
-| `approvalMode` | `off` | 写操作前确认：`off` / `once-per-app` / `always` |
-| `historyEnabled` | `true` | 记录操作历史 |
-| `deniedBundleIDs` | `[]` | 禁止操作的应用 |
-| `allowedBundleIDs` | `[]` | 允许列表，非空时只允许这些 |
-| `browserCdpPort` | `0` | 接管浏览器时用的调试端口，`0` 为自动 |
-
-## 使用须知
-
-- **滚动**：目标在后台时不接受进程内滚轮的应用（如访达的列表），会如实报「内容没有移动」。需要前台滚动时先把窗口切到前面。点击和输入没有这个限制。
-- **拖拽**：需要让目标窗口前置，这是部分 Catalyst 应用的要求。
-- **锁屏**：`unlock_screen` 需要系统密码，只在明确调用时使用，不保存密码。
-- **多会话并行**：多个客户端共用同一个实时画面服务，目标按会话分流，互不可见。
-- **实时画面不出本机**：预览只绑 `127.0.0.1`，同网段访问不到；画面直接由本机进程推送，不经过任何外部服务。
-- **打开未运行的应用**：`open_app` 按「英文文件名 / bundle id / 完整路径」定位，会在标准应用目录（`/Applications`、`/System/Applications` 等）按文件名搜索。
-  两个例外：系统应用的中文显示名（如「计算器」）是系统级本地化、不存进应用包，按中文名找不到；
-  受 Cryptexes 保护的系统应用（如 Safari）不在可遍历目录里，按文件名也找不到。
-  这两种情况请用 bundle id（如 `com.apple.calculator`、`com.apple.Safari`）。
-
-## 许可
-
-MIT
+[MIT](./LICENSE)
