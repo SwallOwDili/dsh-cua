@@ -1570,8 +1570,39 @@ private var layoutKeyCache: [Character: (code: CGKeyCode, shift: Bool)] = [:]
 
 func keyCodeForCharacter(_ ch: Character) -> (code: CGKeyCode, shift: Bool)? {
     if let cached = layoutKeyCache[ch] { return cached }
-    guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-          let prop = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+    // 先查 ASCII 基础布局（ABC），再退回当前输入法的键盘布局。
+    //
+    // 不能只用「当前布局」：中文拼音输入法激活时，TISCopyCurrentKeyboardLayout
+    // InputSource 返回的是 com.apple.keylayout.PinyinKeyboard，它把 ? ! ; :
+    // 映射成全角「？！；：」，按 ASCII 字符去查一律落空。实测（2026-10-28）
+    // press_key "?" 直接报「当前布局下找不到对应键码」，而切到 ABC 就正常。
+    // 对比：
+    //   字符   PinyinKeyboard      ABC
+    //   ?      ✗ 找不到            key=44 shift=true
+    //   !      ✗ 找不到            key=18 shift=true
+    //   ;      ✗ 找不到            key=41 shift=false
+    //   :      ✗ 找不到            key=41 shift=true
+    // 我们发的是物理键码 + shift 标志，语义是「按哪个键」，参考系理应是
+    // 基础布局；中文输入法该不该把 ? 转成全角，是输入法自己的事。
+    //
+    // 注意与 type_text 的分工：type_text 走 unicode 直投，不受布局影响，
+    // 要打「？」应该用 type_text；press_key 打的是键位。
+    let candidates: [TISInputSource?] = [
+        TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+        TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+    ]
+    for case let source? in candidates {
+        if let hit = lookupKeyInLayout(ch, source) {
+            layoutKeyCache[ch] = hit
+            return hit
+        }
+    }
+    return nil
+}
+
+/// 在指定输入源的键位表里查一个字符，返回键码与是否需要 shift。
+private func lookupKeyInLayout(_ ch: Character, _ source: TISInputSource) -> (code: CGKeyCode, shift: Bool)? {
+    guard let prop = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
     else { return nil }
     let cfData = unsafeBitCast(prop, to: CFData.self)
     guard let bytes = CFDataGetBytePtr(cfData) else { return nil }
@@ -1591,9 +1622,8 @@ func keyCodeForCharacter(_ ch: Character) -> (code: CGKeyCode, shift: Bool)? {
             )
             deadKeyState = 0
             if status == noErr, length > 0, Array(chars[0..<length]) == want {
-                let hit = (code: CGKeyCode(code), shift: shifted)
-                layoutKeyCache[ch] = hit
-                return hit
+                // 缓存由调用方统一写，这里只负责在给定布局里查。
+                return (code: CGKeyCode(code), shift: shifted)
             }
         }
     }
@@ -1763,27 +1793,35 @@ func typeText(pid: pid_t, text: String) throws {
     guard let src = CGEventSource(stateID: .hidSystemState) else {
         throw CUAError.eventFailed("无法创建事件源")
     }
-    let units = Array(text.utf16)
-    var i = 0
-    while i < units.count {
-        var end = min(i + 20, units.count)
-        // 别把代理对切成两半：切点前一个是高位代理（D800–DBFF）且后面还有内容时退一格。
-        // 切开了就是两个孤立代理，注入出去是乱码（emoji 尤其明显）。
-        if end < units.count, units[end - 1] >= 0xD800, units[end - 1] <= 0xDBFF { end -= 1 }
-        let chunk = Array(units[i..<end])
+    // 逐字符投递，不再按 20 个 UTF-16 单元切块。
+    //
+    // 切块版本实测会稳定丢掉中间那些块。用 TextEdit 复现（2026-10-28）：
+    //   "CUA 端到端验证 2026-10-28\n中文输入：这是一段测试文本\nEmoji：🧪🚀✨🎯👨‍👩‍👧‍👦\n"
+    //   53 字符 / 60 单元 = 3 块 → 只进 34 个字符，中间两行整段消失，
+    //   而第一行、全角冒号、emoji 都在。三次重试结果逐字节相同。
+    // 关键排除：把块间 usleep 从 4ms 提到 30ms，结果一字不差还是 34 个
+    //   —— 所以不是投递太快，是「一个 unicode 事件带多字符」本身在目标侧
+    //   不可靠。逐字符之后同一段文本 236ms 全部正确。
+    //
+    // 按 Character 遍历还顺带解决了代理对：一个 Character 可能是多个 UTF-16
+    // 单元（emoji、ZWJ 家族如 👨‍👩‍👧‍👦 是 11 个），整体塞进同一个事件，
+    // 不存在「切点正好落在代理对中间」的情况，也就不需要退格补救了。
+    //
+    // 代价是每字符一次往返，长文本变慢（100 字约 330ms）。这个量级可以接受，
+    // 换来的是「打进去的就是要打的」——静默丢字比慢糟得多。
+    for ch in text {
+        let units = Array(String(ch).utf16)
         guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
             throw CUAError.eventFailed("文本事件创建失败")
         }
-        chunk.withUnsafeBufferPointer { buf in
+        units.withUnsafeBufferPointer { buf in
             down.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress!)
             up.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress!)
         }
         down.postToPid(pid)
         up.postToPid(pid)
-        i += chunk.count
-        // 短文本一次投递即可，不需要让出时间片；长文本才在分块间小睡。
-        if units.count > 20 { usleep(4_000) }
+        usleep(1_500)
     }
 }
 
