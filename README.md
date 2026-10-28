@@ -31,37 +31,48 @@ Elements: 122
 
 ## 安装
 
-一条命令，不需要 clone，不需要 Xcode：
+拿到 `dsh-cua/` 目录，两种方式任选：
 
 ```bash
+# 方式一：下载预编译包（推荐，不需要 clone、不需要 Xcode）
 curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-macos-universal.tar.gz | tar xz
-```
 
-解压出 `dsh-cua/`，里面的 `bin/` 是 arm64 + x86_64 通用二进制。下文所有命令里的
-`<解压目录>` 都指这个路径。
-
-也可以从源码获取：
-
-```bash
+# 方式二：克隆源码（仓库里同样带预编译二进制）
 git clone https://github.com/SwallowDili/dsh-cua.git
 ```
 
-两种方式拿到的内容相同，仓库里同样带预编译二进制。
+解压/克隆出的 `dsh-cua/` 里，`bin/` 是 arm64 + x86_64 通用二进制。下文所有命令里的
+`<解压目录>` 都指这个路径。
 
 需要 macOS 14+。
 
-### 作为 dsh 插件
+## 使用方式
 
-放进 dsh profile 的 `node_modules` 下：
+两种用法，按需选一种：
+
+### 作为 dsh 插件（推荐）
+
+一条命令，直接装到 dsh profile：
+
+```bash
+dsh plugin --profile web add github:SwallOwDili/dsh-cua
+```
+
+`--profile web` 是目标 profile（默认就是 `web`，可省略）。`dsh plugin add` 转发给
+该 profile 目录下的 pnpm，`github:` 前缀会从 GitHub 拉取仓库装进
+`~/.dsh/profiles/<profile>/node_modules/dsh-cua`，不需要手动 clone。
+
+也可以先拿到目录再拷贝（例如自己 clone 源码开发时）：
 
 ```bash
 cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 ```
 
-`<profile>` 是你的 profile 名（默认 `web`）。这个位置不能换——插件依赖 dsh 提供的
-`schemastery`，只有放在 profile 的 `node_modules` 下才解析得到。
+这个位置不能换——插件依赖 dsh 提供的 `schemastery`，只有放在 profile 的
+`node_modules` 下才解析得到。
 
-重启 dsh 后，工具会出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
+重启 dsh 后，工具自动出现在模型侧，参数在「设置 → 插件配置 → cua」里调整。
+走插件链路时，操作会自动归属到当前会话，实时画面小窗只出现在对应的对话里。
 
 ### 作为独立 MCP 服务器
 
@@ -71,49 +82,13 @@ cp -R dsh-cua ~/.dsh/profiles/<profile>/node_modules/dsh-cua
 <解压目录>/bin/cua-mcp
 ```
 
-它是个 stdio 服务器，不需要额外的运行环境。
+它是个标准 stdio MCP 服务器，跟 dsh 没有耦合，不需要额外的运行环境。
 
-## 授权
+把二进制的绝对路径填进 MCP 客户端的 `command` 即可。在解压目录里执行
+`echo "$(pwd)/bin/cua-mcp"` 拿到绝对路径。装了 dsh 插件、想用 profile 里那份的话，
+路径是 `~/.dsh/profiles/<profile>/node_modules/dsh-cua/bin/cua-mcp`。
 
-首次使用前，给承载进程（终端或 DSH Desktop）两项系统权限：
-
-- **辅助功能**：读界面、点元素。没有它所有工具都会失败。
-- **屏幕录制**：截图。没有它截图不可用，其余功能正常。
-
-在「系统设置 → 隐私与安全性」里勾选后重启宿主进程。插件启动时会自检并明确报出缺哪一项。
-
-## 对接方式
-
-`bin/cua-mcp` 是标准 stdio MCP 服务器，跟 dsh 没有耦合，任何 MCP 客户端都能直接接。
-
-### dsh 插件（推荐）
-
-装上即用，工具自动出现在模型侧。插件名 `cua`，配置在设置页。走插件链路时，操作会自动归属到当前会话，实时画面小窗只出现在对应的对话里。
-
-### 任意 MCP 客户端
-
-先拿到二进制的绝对路径（在解压目录里执行）：
-
-```bash
-echo "$(pwd)/bin/cua-mcp"
-```
-
-把输出填进 `command`。下面 `"/Users/you/code/dsh-cua"` 是示例，换成你的实际路径：
-
-```json
-{
-  "mcpServers": {
-    "computer-use": {
-      "command": "/Users/you/code/dsh-cua/bin/cua-mcp"
-    }
-  }
-}
-```
-
-装了 dsh 插件、想用 profile 里那份的话，路径是
-`~/.dsh/profiles/<profile>/node_modules/dsh-cua/bin/cua-mcp`。
-
-### OpenCode
+OpenCode 的接法：
 
 ```json
 {
@@ -133,7 +108,15 @@ echo "$(pwd)/bin/cua-mcp"
 `timeout` 建议调大，默认 30 秒会把正常操作腰斩。`CUA_SESSION` 声明这次操作归属哪个会话——
 设了它，实时画面小窗才会出现在对应对话里；不设也能正常操作，只是不会显示预览。
 
-授权是独立的一份：从哪个终端启动 OpenCode，就给那个终端勾选辅助功能与屏幕录制。
+## 授权
+
+首次使用前，给承载进程（终端或 DSH Desktop）两项系统权限：
+
+- **辅助功能**：读界面、点元素。没有它所有工具都会失败。
+- **屏幕录制**：截图。没有它截图不可用，其余功能正常。
+
+在「系统设置 → 隐私与安全性」里勾选后重启宿主进程。插件启动时会自检并明确报出缺哪一项。
+从哪个终端启动客户端，就给那个终端勾选这两项权限。
 
 ## 工具
 
