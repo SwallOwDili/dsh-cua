@@ -24,6 +24,10 @@ import ImageIO
 import UniformTypeIdentifiers
 
 let listenPort: UInt16 = 18901
+/// 协议版本。cua-mcp 的 Live.ensureRunning 会拿它和期望值比对，
+/// 不符就把这个进程杀掉重开——Mach-O 一旦加载就固定在内存里，
+/// 二进制换了而老进程还活着时，不加这道校验就会一直在跑旧代码。
+let liveVersion = "1"
 let frameInterval: TimeInterval = 1.0 / 3.0
 // 预览卡显示宽度是 132 CSS px（见 client.js 的 CARD_W）。
 // 抓 2 倍做 retina 就够，480 是 3.6 倍过采样，四分之三的像素编码完就扔。
@@ -195,7 +199,7 @@ final class LiveState {
 
     /// 客户端订阅：一条连接只收它指定的窗口（nil 表示收任意窗口）。
     /// lastSend 用来兜底清理收不到 FIN 的死连接。
-    private var clients: [(conn: NWConnection, window: CGWindowID?, lastSend: Date)] = []
+    private var clients: [(conn: NWConnection, window: CGWindowID, lastSend: Date)] = []
 
     func setTarget(pid: pid_t, appName: String, ttl: Double, explicit: CGWindowID?, session: String = "") {
         guard let wid = explicit ?? windowID(for: pid) else { return }
@@ -302,11 +306,11 @@ final class LiveState {
         frames[target.windowID] = Frame(jpeg: jpeg, seq: seq, width: width, height: height)
         missCounts[target.windowID] = 0
         let now = Date()
-        for i in clients.indices where clients[i].window == nil || clients[i].window == target.windowID {
+        for i in clients.indices where clients[i].window == target.windowID {
             clients[i].lastSend = now
         }
         let recipients = clients
-            .filter { $0.window == nil || $0.window == target.windowID }
+            .filter { $0.window == target.windowID }
             .map { $0.conn }
         lock.unlock()
 
@@ -323,18 +327,13 @@ final class LiveState {
         }
     }
 
-    func addClient(_ conn: NWConnection, window: CGWindowID?) {
+    func addClient(_ conn: NWConnection, window: CGWindowID) {
         lock.lock()
         clients.append((conn, window, Date()))
-        // 指定了窗口就只能给这个窗口的帧。之前这里对两种情况都用了
-        // 「退到最新的一帧」，结果是订阅 A 的连接在首帧到达前会先收到
-        // B 的一帧画面——跨会话直接串画面。
-        let seed: Data?
-        if let w = window {
-            seed = frames[w]?.jpeg
-        } else {
-            seed = frames.values.max { $0.seq < $1.seq }?.jpeg
-        }
+        // 只给这个窗口的帧。之前对「没指定窗口」的连接会退到「最新的一帧」，
+        // 结果订阅 A 的连接在首帧到达前先收到 B 的画面——跨会话直接串画面。
+        // 现在窗口号是必填的，这条路已经不存在了。
+        let seed = frames[window]?.jpeg
         lock.unlock()
         if let frame = seed {
             var chunk = Data("--\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(frame.count)\r\n\r\n".utf8)
@@ -357,9 +356,10 @@ final class LiveState {
         lock.lock()
         let now = Date()
         var dead: [NWConnection] = []
-        var keep: [(conn: NWConnection, window: CGWindowID?, lastSend: Date)] = []
+        var keep: [(conn: NWConnection, window: CGWindowID, lastSend: Date)] = []
         for c in clients {
-            let orphan = c.window.map { targets[$0] == nil } ?? false
+            // 订阅的窗口已经不在目标里了：这条流不会再有任何帧
+            let orphan = targets[c.window] == nil
             let stale = now.timeIntervalSince(c.lastSend) > idle
             if orphan || stale {
                 dead.append(c.conn)
@@ -564,6 +564,11 @@ func jsonResponse(_ obj: [String: Any]) -> Data {
     return httpResponse("200 OK", "application/json; charset=utf-8", body)
 }
 
+/// 明确的拒绝回包。用状态码说清楚，别伪装成 200 让调用方以为成功。
+func textResponse(_ status: String, _ body: String) -> Data {
+    httpResponse(status, "text/plain; charset=utf-8", Data((body + "\n").utf8))
+}
+
 func mjpegHeader() -> Data {
     var head = "HTTP/1.1 200 OK\r\n"
     head += "Content-Type: multipart/x-mixed-replace; boundary=\(boundary)\r\n"
@@ -602,17 +607,36 @@ func handleConnection(_ conn: NWConnection) {
         let rawPath = pieces.count > 1 ? String(pieces[1]) : "/"
         let (route, params) = parseQuery(rawPath)
 
+        // 浏览器发起的请求会带 Sec-Fetch-Site。外站页面里嵌一个 <img> 或 <form>
+        // 就能打到这里的 GET 接口，而 /target 能把任意应用注册成捕获目标、
+        // /focus 能把窗口抬到最前——这些都不该由别的网站触发。
+        // curl / cua-mcp 这类非浏览器调用没有这个头，视为本地可信调用放行。
+        let fetchSite = request
+            .split(separator: "\r\n")
+            .first { $0.lowercased().hasPrefix("sec-fetch-site:") }?
+            .split(separator: ":", maxSplits: 1).last?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let crossSite = fetchSite == "cross-site"
+
         switch (method, route) {
         case (_, "/status"):
             RequestLog.note(rawPath)
             let list = state.snapshot(session: params["session"])
             conn.send(content: jsonResponse([
+                // 版本握手用：cua-mcp 按它判断要不要杀掉这个进程重开
+                "version": liveVersion,
                 "active": !list.isEmpty,
                 "targets": list,
                 "viewers": state.clientCount(),
             ]), completion: .contentProcessed { _ in conn.cancel() })
 
         case (_, "/focus"):
+            guard !crossSite else {
+                conn.send(content: textResponse("403 Forbidden", "跨站请求不能操作窗口"),
+                          completion: .contentProcessed { _ in conn.cancel() })
+                break
+            }
             guard let t = state.activeTarget(window: params["window"].flatMap { CGWindowID($0) }) else {
                 conn.send(content: jsonResponse(["ok": false, "reason": "当前没有操作目标"]),
                           completion: .contentProcessed { _ in conn.cancel() })
@@ -631,6 +655,11 @@ func handleConnection(_ conn: NWConnection) {
             ]), completion: .contentProcessed { _ in conn.cancel() })
 
         case (_, "/target"):
+            guard !crossSite else {
+                conn.send(content: textResponse("403 Forbidden", "跨站请求不能注册捕获目标"),
+                          completion: .contentProcessed { _ in conn.cancel() })
+                break
+            }
             let pid = pid_t(params["pid"] ?? "") ?? 0
             let app = params["app"] ?? ""
             let ttl = Double(params["ttl"] ?? "") ?? 20
@@ -647,13 +676,27 @@ func handleConnection(_ conn: NWConnection) {
             ]), completion: .contentProcessed { _ in conn.cancel() })
 
         case (_, "/clear"):
+            guard !crossSite else {
+                conn.send(content: textResponse("403 Forbidden", "跨站请求不能清空目标"),
+                          completion: .contentProcessed { _ in conn.cancel() })
+                break
+            }
             state.clear()
             conn.send(content: jsonResponse(["ok": true]),
                        completion: .contentProcessed { _ in conn.cancel() })
 
         case (_, "/live.mjpg"):
+            // win 必填。原来不带 win 的连接会收到「最新目标」的帧，
+            // 于是本机任意页面写一行 <img src="/live.mjpg"> 就能看到
+            // AI 正在操作的那个窗口，连窗口号都不用知道。
+            // 前端一直是带 win 的，这条路没有正常使用者。
+            guard let windowParam = params["win"], let window = CGWindowID(windowParam) else {
+                conn.send(content: textResponse("400 Bad Request", "缺少 win 参数：/live.mjpg?win=<CGWindowID>"),
+                          completion: .contentProcessed { _ in conn.cancel() })
+                break
+            }
             conn.send(content: mjpegHeader(), completion: .contentProcessed { _ in })
-            state.addClient(conn, window: params["win"].flatMap { CGWindowID($0) })
+            state.addClient(conn, window: window)
             conn.stateUpdateHandler = { newState in
                 switch newState {
                 case .failed, .cancelled:

@@ -369,17 +369,32 @@ enum History {
 // 白名单（只允许这些）优先于黑名单（禁止这些），都按 bundleID 精确匹配。
 // 命中就在工具分发层拒绝，不让动作落到目标应用上。
 
-func policyDecision(for app: AppRef) -> String? {
+/// 策略判定的本体。两个入口共用：有 AppRef 的（GUI 操作）
+/// 和只有 bundleID 的（CDP 浏览器，工具参数里根本没有 app）。
+func policyReason(bundleID: String, name: String) -> String? {
     let cfg = CuaConfig.current()
     let blocked = cfg.deniedBundleIDs
     let allowed = cfg.allowedBundleIDs
-    if !allowed.isEmpty, !allowed.contains(app.bundleID) {
-        return "\(app.name)（\(app.bundleID)）不在允许列表内；当前只允许: " + allowed.joined(separator: ", ")
+    if !allowed.isEmpty, !allowed.contains(bundleID) {
+        return "\(name)（\(bundleID)）不在允许列表内；当前只允许: " + allowed.joined(separator: ", ")
     }
-    if blocked.contains(app.bundleID) {
-        return "\(app.name)（\(app.bundleID)）在禁止列表内，操作被拒绝"
+    if blocked.contains(bundleID) {
+        return "\(name)（\(bundleID)）在禁止列表内，操作被拒绝"
     }
     return nil
+}
+
+func policyDecision(for app: AppRef) -> String? {
+    policyReason(bundleID: app.bundleID, name: app.name)
+}
+
+/// 按 bundleID 判定。给 CDP 那条路用——browser_* 没有 app 参数，
+/// 早先因此完全绕过了白/黑名单：把 Chrome 拉黑之后，
+/// browser_eval 照样能在里面跑任意 JS。
+func policyDecision(bundleID: String) -> String? {
+    let name = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        .first?.localizedName ?? bundleID
+    return policyReason(bundleID: bundleID, name: name)
 }
 
 struct RuntimeConfig: Decodable {
@@ -1249,23 +1264,42 @@ enum Live {
         URL(string: "http://127.0.0.1:\(port)\(path)")
     }
 
-    /// 端口上是否已经有人应答。用同步请求，超时压到 200ms。
-    static func isServing() -> Bool {
-        guard let u = url("/status") else { return false }
+    /// 探测端口上是否有人应答，并返回它自报的协议版本。
+    /// 同步请求，超时压到 200ms。
+    ///
+    /// 只判「有没有 200」是不够的：cua-live 是 cua-mcp 的孤儿子进程，
+    /// 宿主重启也带不走它；二进制换新之后老进程继续跑旧代码，
+    /// 于是改了没生效。带版本号回来才能识别这种情形。
+    static func servingVersion() -> String? {
+        guard let u = url("/status") else { return nil }
         var req = URLRequest(url: u)
         req.timeoutInterval = 0.2
         let sem = DispatchSemaphore(value: 0)
-        var ok = false
-        URLSession.shared.dataTask(with: req) { _, resp, _ in
-            if let http = resp as? HTTPURLResponse, http.statusCode == 200 { ok = true }
-            sem.signal()
+        var version: String?
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return }
+            // 老版本没有 version 字段，取到空串——正好和期望值不等，会触发重建
+            version = obj["version"] as? String ?? ""
         }.resume()
         _ = sem.wait(timeout: .now() + 0.4)
-        return ok
+        return version
     }
 
+    /// 与 cua-live 里 `liveVersion` 对应。改了它的接口语义就要一起改。
+    static let expectedVersion = "1"
+
     static func ensureRunning() {
-        if isServing() { return }
+        if let running = servingVersion() {
+            if running == expectedVersion { return }
+            // 版本不符：杀掉重开。这里不走优雅退出——cua-live 没有命令通道，
+            // 强杀是唯一的办法，它是只读抓帧进程，突然消失没有副作用。
+            for pid in pids(matching: "cua-live") { kill(pid, SIGTERM) }
+            usleep(250_000)
+        }
         // 这里原来有个 launched 短路：cua-live 一旦退出（崩溃、被杀、系统回收），
         // 标志还是 true，于是永远不再拉起，预览从此消失到 dsh 重启为止。
         // 改成只按时间防连击，存活与否每次实际探测。
@@ -1278,7 +1312,7 @@ enum Live {
         p.standardError = FileHandle.nullDevice
         try? p.run()
         for _ in 0..<40 {
-            if isServing() { return }
+            if servingVersion() == expectedVersion { return }
             usleep(25_000)
         }
     }
@@ -1310,6 +1344,21 @@ enum Live {
         URLSession.shared.dataTask(with: req) { _, _, _ in sem.signal() }.resume()
         _ = sem.wait(timeout: .now() + 0.8)
     }
+}
+
+/// 按命令行子串找进程。
+/// cua-live / cua-overlay 都是常驻的孤儿子进程，二进制更新后旧实例还活着，
+/// 需要按名字把它们找出来杀掉，否则新代码永远不生效。
+func pids(matching pattern: String) -> [pid_t] {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    p.arguments = ["-f", pattern]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    try? p.run()
+    p.waitUntilExit()
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return out.split(separator: "\n").compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
 }
 
 enum Overlay {
@@ -1402,15 +1451,7 @@ enum Overlay {
 
     /// 找出所有 cua-overlay 进程。旧版本不响应 quit 时兜底。
     static func overlayPIDs() -> [pid_t] {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-f", "cua-overlay"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        try? p.run()
-        p.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return out.split(separator: "\n").compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
+        pids(matching: "cua-overlay")
     }
 
     /// 用一次 connect 探活，失败即视为没有 overlay 在监听。
@@ -1596,6 +1637,33 @@ func scrollSignature(_ root: AXUIElement) -> [Double]? {
     return ys.isEmpty ? nil : ys
 }
 
+/// 读当前滚动条进度（0…1），用来区分「滚不动」和「已经到头了」。
+///
+/// 没有这个信号时，滚到顶部/底部会被当成「该视图不接受后台滚动」报错，
+/// 模型据此切前台去做一件本来就不该做的事。宁可多走一次树也别误报。
+/// 找不到滚动条返回 nil——那才是真的无法判断。
+func scrollBarProgress(pid: pid_t, vertical: Bool) -> Double? {
+    let root = AXUIElementCreateApplication(pid)
+    var found: Double?
+    var visited = 0
+    func walk(_ el: AXUIElement, _ depth: Int) {
+        if found != nil || depth > 20 || visited > 800 { return }
+        visited += 1
+        if let role = attr(el, kAXRoleAttribute as String) as? String, role == "AXScrollBar" {
+            let o = (attr(el, kAXOrientationAttribute as String) as? String) ?? "AXVerticalOrientation"
+            let isVertical = o != "AXHorizontalOrientation"
+            if isVertical == vertical,
+               let v = (attr(el, kAXValueAttribute as String) as? NSNumber)?.doubleValue {
+                found = v
+                return
+            }
+        }
+        for child in childrenOf(el) { walk(child, depth + 1) }
+    }
+    walk(root, 0)
+    return found
+}
+
 /// 等滚动停稳。找不到滚动条时退化为短等，不空耗。
 func waitForScrollToSettle(pid: pid_t, timeout: TimeInterval = 1.2) {
     let appEl = AXUIElementCreateApplication(pid)
@@ -1658,15 +1726,17 @@ func postKey(pid: pid_t, key: String) throws {
     // 命名键查表时才转小写，单字符按原样交给布局反查。
     let tokens = key.split(separator: "+").map(String.init)
     guard let last = tokens.last, !last.isEmpty else { throw CUAError.badRequest("按键为空") }
-    // 命名键走静态表；单个可打印字符按当前布局反查
+    // 命名键走静态表；单个可打印字符按当前布局反查。
+    // 顺序不能反：「A」在静态表里以 lowercased 的形式存在（keyCodes["a"]），
+    // 先查表就会命中不带 shift 的 a 键码，打出来是小写。
+    // 单字符一律先走布局反查——那里才知道要 shift 才能出大写/带 shift 的符号。
     let code: CGKeyCode
     var needsShift = false
-    if let named = keyCodes[last.lowercased()] {
-        code = named
-    } else if last.count == 1, let ch = last.first, let hit = keyCodeForCharacter(ch) {
-        // 布局反查命中 shifted 分支时必须补上 shift，否则 "?" 打成 "/"
+    if last.count == 1, let ch = last.first, let hit = keyCodeForCharacter(ch) {
         code = hit.code
         needsShift = hit.shift
+    } else if let named = keyCodes[last.lowercased()] {
+        code = named
     } else {
         throw CUAError.badRequest("无法识别的按键: \(key)（当前布局下找不到对应键码）")
     }
@@ -1801,7 +1871,20 @@ func clickAt(pid: pid_t, point: CGPoint, button: Int, count: Int) throws {
 /// 代价（HID 是真实系统输入）：
 ///   1. 真实移动光标到滚动点；
 ///   2. 事件作用于光标下最顶层窗口——目标不在前台时先激活。
-func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) throws {
+/// 一次滚动能给出的三种结论。
+///
+/// 别把「没观察到变化」直接当成失败：滚到顶/底时内容本来就不动，
+/// 报成失败会让模型切前台去做一件本来就不该做的事。
+enum ScrollOutcome {
+    /// 观察到了内容位移
+    case moved
+    /// 已经在顶/底，没得滚了
+    case atBoundary
+    /// 事件投递了，但既没位移也没能确认边界
+    case unchanged
+}
+
+func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) throws -> ScrollOutcome {
     guard let src = CGEventSource(stateID: .hidSystemState) else {
         throw CUAError.eventFailed("无法创建事件源")
     }
@@ -1850,13 +1933,23 @@ func scrollAt(pid: pid_t, point: CGPoint?, direction: String, pages: Double) thr
     }
     wheel(4, 0, 0)
     usleep(240_000)
-    if let before = beforeSig,
-       let after = scrollSignature(AXUIElementCreateApplication(pid)), before == after {
-        throw CUAError.eventFailed(
-            "\(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "目标")的当前视图不接受后台滚动，"
-            + "内容没有移动。需要前台滚动时，请先把该窗口切到前面再试。"
-        )
+    guard let before = beforeSig,
+          let after = scrollSignature(AXUIElementCreateApplication(pid)),
+          before == after else { return .moved }
+
+    // 没动。先排除「本来就在边界」——滚到顶/底时签名必然不变，
+    // 那是正常结果，不是失败。滚动条读不到才退化成「不确定」。
+    let vertical = (direction == "up" || direction == "down")
+    if let v = scrollBarProgress(pid: pid, vertical: vertical) {
+        let atStart = v <= 0.001
+        let atEnd = v >= 0.999
+        if direction == "down" || direction == "right" {
+            if atEnd { return .atBoundary }
+        } else if atStart {
+            return .atBoundary
+        }
     }
+    return .unchanged
 }
 
 // MARK: - 剪贴板粘贴
@@ -2200,7 +2293,7 @@ func toolGetAppState(_ args: [String: Any]) throws -> [[String: Any]] {
     var treeText = snap.text
     if let tip = appInstruction(bundleID: ref.bundleID) {
         // 插在 App 行之后：模型读节点前先看到这个应用的注意事项
-        var lines = treeText.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        let lines = treeText.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
         if lines.count == 2 {
             treeText = String(lines[0]) + "\n[应用提示] " + tip + "\n" + String(lines[1])
         } else {
@@ -2358,6 +2451,28 @@ func cdpPort(_ args: [String: Any]) throws -> Int {
     throw CUAError.badRequest(
         "未找到浏览器调试端口。需以 --remote-debugging-port=9222 启动 Chrome/Edge 后重试；"
         + "或显式传 port 参数。")
+}
+
+/// 找出 CDP 端口对应的浏览器进程，返回它的 bundleID。
+/// 用 lsof 反查监听者：不管端口来自 DevToolsActivePort 还是显式配置，
+/// 这条都能拿到真实进程，不用猜路径，也不怕用户装了非主流 Chromium 分支。
+func cdpBrowserBundleID(_ port: Int) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    p.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return nil }
+    p.waitUntilExit()
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    for line in out.split(separator: "\n") {
+        guard let pid = pid_t(line.trimmingCharacters(in: .whitespaces)) else { continue }
+        if let bid = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier {
+            return bid
+        }
+    }
+    return nil
 }
 
 func cdpJSON(_ port: Int, _ path: String, method: String = "GET") throws -> Any {
@@ -2603,8 +2718,14 @@ func toolScroll(_ args: [String: Any]) throws -> [[String: Any]] {
     // 与 click 一致：目标不认为自己在前台时滚动事件会被丢弃
     prepareTarget(pid: ref.pid)
     let pages = (args["pages"] as? Double) ?? 1.0
-    var pt = try? resolvePoint(args, pid: ref.pid)
-    if pt == nil {
+    // 指定了目标就必须落到目标上。原来写 try? resolvePoint，
+    // 元素失效时错误被吞掉、静默退化成「滚窗口中心」——滚错地方还报成功，
+    // 比直接报错糟得多。只有完全没给目标时才用窗口中心兜底。
+    let hasExplicitTarget = args["element_index"] != nil || args["x"] != nil || args["y"] != nil
+    var pt: CGPoint?
+    if hasExplicitTarget {
+        pt = try resolvePoint(args, pid: ref.pid)
+    } else {
         // 没给坐标就用目标窗口中心。滚轮事件落在鼠标当前位置，
         // 不先移过去就会滚到用户正在看的那个窗口上。
         let appEl = AXUIElementCreateApplication(ref.pid)
@@ -2616,10 +2737,21 @@ func toolScroll(_ args: [String: Any]) throws -> [[String: Any]] {
         }
     }
     if let pt = pt { Overlay.cursorMove(x: pt.x, y: pt.y) }
-    try scrollAt(pid: ref.pid, point: pt, direction: dir, pages: pages)
+    let outcome = try scrollAt(pid: ref.pid, point: pt, direction: dir, pages: pages)
     // 等惯性滑停再往下走，否则后续点击会打偏
     waitForScrollToSettle(pid: ref.pid)
-    return [["type": "text", "text": "已在 \(ref.name) 向 \(dir) 滚动 \(pages) 页"]]
+    switch outcome {
+    case .moved:
+        return [["type": "text", "text": "已在 \(ref.name) 向 \(dir) 滚动 \(pages) 页"]]
+    case .atBoundary:
+        let edge = (dir == "down" || dir == "right") ? "底" : "顶"
+        return [["type": "text", "text": "\(ref.name) 已经滚到\(edge)了，没有更多内容可滚"]]
+    case .unchanged:
+        return [["type": "text",
+                 "text": "已向 \(dir) 投递滚动事件，但没观察到内容移动。"
+                    + "可能是这个视图不接受后台滚动（少数应用如此），也可能当前区域本来就滚不动。"
+                    + "先别急着切前台——如果目标本来就在边界，切了也不会动。"]]
+    }
 }
 
 func toolSetValue(_ args: [String: Any]) throws -> [[String: Any]] {
@@ -2923,6 +3055,22 @@ func dispatch(_ method: String, _ params: [String: Any]) throws -> Any? {
         // 应用策略（白/黑名单）由 resolveApp 在解析到的当场判定，这里不再重复查。
         // 旧版在这里调 resolveApp 拿 bundleID，而它会拉起未运行的应用，
         // 于是「禁止某个应用」变成了「先启动再拒绝」。
+        //
+        // browser_* 是例外：它走 CDP，工具参数里没有 app，resolveApp 那套根本轮不到，
+        // 于是把 Chrome 拉黑之后 browser_eval 照样能在里面跑任意 JS。
+        // 这里单独按「谁在监听 CDP 端口」反查 bundleID 再判一次。
+        if name.hasPrefix("browser_"), let port = try? cdpPort(args) {
+            if let bid = cdpBrowserBundleID(port) {
+                if let reason = policyDecision(bundleID: bid) {
+                    throw CUAError.badRequest(reason)
+                }
+            } else if !CuaConfig.current().allowedBundleIDs.isEmpty {
+                // 连不上端口/查不到进程时，白名单语义要求「只允许列出的应用」，
+                // 无法确认就必须拒绝，不能默认放行。
+                throw CUAError.badRequest(
+                    "无法确认 CDP 端口 \(port) 属于哪个应用，而允许列表非空，操作被拒绝")
+            }
+        }
         let content: [[String: Any]]
         switch name {
         case "list_apps": content = try toolListApps(args)

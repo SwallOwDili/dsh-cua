@@ -385,6 +385,27 @@ export async function apply(ctx, config) {
     }
   }
 
+  /**
+   * 工具名撞车时退到带前缀的名字。
+   *
+   * cua 的工具用的是 MCP 原名（click / scroll / paste / drag / history），
+   * 这些词太通用。别的插件注册了同名工具时，cordis 会直接拒绝注册，
+   * 而这里是在一个循环里注册 19 个——一个撞名就整批失败，
+   * 表现为「插件加载了但一个工具都没有」。撞了就改名，至少能用。
+   */
+  const uniqueToolName = (name) => {
+    let taken
+    try {
+      taken = ctx.tools?.get?.(name)
+    } catch {
+      return name
+    }
+    if (!taken) return name
+    const prefixed = `cua_${name}`
+    ctx.logger?.warn?.(`dsh-cua: 工具名 "${name}" 已被其他插件占用，改用 "${prefixed}"`)
+    return prefixed
+  }
+
   // 工具表来自子进程的 tools/list，只有拿到它才知道挂什么。
   // 一次失败就把整个会话变成「没有任何工具」，而多数失败都是瞬时的
   // （二进制正在被 build.sh 覆盖、握手竞争）。所以给它三次退避重试。
@@ -399,7 +420,7 @@ export async function apply(ctx, config) {
       for (const tool of tools) {
         disposers.push(
           ctx.tools.register({
-            name: tool.name,
+            name: uniqueToolName(tool.name),
             description: tool.description ?? '',
             parameters: toParameters(tool.inputSchema),
             output: {

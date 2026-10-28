@@ -73,7 +73,12 @@ export class McpBridge extends EventEmitter {
       const error = new Error(
         `cua-mcp 退出 (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
       )
-      for (const [, pending] of this.#pending) pending.reject(error)
+      for (const [, pending] of this.#pending) {
+        // 定时器也要清。不清的话每次异常退出都会留下几个 180 秒的
+        // Timeout 句柄，进程被反复重启时越积越多，还会拖住宿主退出。
+        clearTimeout(pending.timer)
+        pending.reject(error)
+      }
       this.#pending.clear()
       this.emit('exit', { code, signal })
     })
@@ -110,6 +115,18 @@ export class McpBridge extends EventEmitter {
       try {
         message = JSON.parse(line)
       } catch {
+        // 不能静默 continue：那条请求会一直挂到 180 秒超时，
+        // 而调用方只会看到「超时」，完全不知道是报文坏了。
+        this.emit('stderr', `[bridge] 无法解析的报文: ${line.slice(0, 200)}\n`)
+        // 尽力从坏行里捞出 id，让对应请求立刻失败而不是干等
+        const idMatch = /"id"\s*:\s*(\d+)/.exec(line)
+        const failedId = idMatch ? Number(idMatch[1]) : undefined
+        const failed = failedId === undefined ? undefined : this.#pending.get(failedId)
+        if (failed) {
+          this.#pending.delete(failedId)
+          clearTimeout(failed.timer)
+          failed.reject(new Error(`cua-mcp 返回了无法解析的报文: ${line.slice(0, 120)}`))
+        }
         continue
       }
       const id = message.id

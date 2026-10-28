@@ -531,13 +531,31 @@ final class CommandServer {
             OverlayWindow.noteActivity()
             if fd < 0 { continue }
 
-            var buf = [UInt8](repeating: 0, count: 4096)
-            let n = read(fd, &buf, buf.count)
-            guard n > 0 else { close(fd); continue }
+            // 一次 read 未必拿得到完整报文：短读时 JSON 解析失败，
+            // 整条命令就被丢掉了（丢的可能是 cursor 移动，也可能是 quit）。
+            // 给 socket 一个很短的接收超时，累积到能解析为止；
+            // 超时说明对端没发完或发的不是 JSON，按坏命令丢弃。
+            var tv = timeval(tv_sec: 0, tv_usec: 250_000)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                       socklen_t(MemoryLayout<timeval>.size))
 
-            let data = Data(buf[0..<n])
-            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let cmd = obj["cmd"] as? String else { close(fd); continue }
+            var data = Data()
+            var obj: [String: Any]?
+            while data.count < 1 << 16 {
+                var chunk = [UInt8](repeating: 0, count: 4096)
+                let n = read(fd, &chunk, chunk.count)
+                if n > 0 {
+                    data.append(contentsOf: chunk[0..<n])
+                    if let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        obj = parsed
+                        break
+                    }
+                    continue
+                }
+                if n < 0, errno == EINTR { continue }
+                break
+            }
+            guard let obj, let cmd = obj["cmd"] as? String else { close(fd); continue }
 
             if cmd == "cursor" {
                 let x = (obj["x"] as? Double) ?? 0
