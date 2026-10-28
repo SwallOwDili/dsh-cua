@@ -2,8 +2,10 @@
 
 macOS 上的 Computer Use：让模型直接看见并操作你的桌面应用。
 
-不依赖辅助窗口、不接管鼠标键盘，也不把屏幕画面发给模型。模型拿到的是应用的无障碍树——
+不依赖辅助窗口、不接管鼠标键盘。模型主要拿到的是应用的无障碍树——
 一份结构化的可用元素清单，靠它决定点哪里、输入什么、操作有没有生效。
+截图是按需附带的：默认只在画面确实变了才附一张，随工具结果一起交给模型
+（存进宿主的附件服务，按引用传递）；不要图可以传 `screenshot: never`。
 
 ```
 App: 访达 (pid 476)
@@ -32,7 +34,7 @@ Elements: 122
 一条命令，不需要 clone，不需要 Xcode：
 
 ```bash
-curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-1.12.9-macos-universal.tar.gz | tar xz
+curl -L https://github.com/SwallowDili/dsh-cua/releases/latest/download/dsh-cua-1.13.0-macos-universal.tar.gz | tar xz
 ```
 
 解压出 `dsh-cua/`，里面的 `bin/` 已经是 arm64 + x86_64 通用二进制。

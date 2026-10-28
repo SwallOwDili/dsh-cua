@@ -232,13 +232,33 @@ export function toParameters(schema) {
   return parameters
 }
 
-/** MCP 的 content 数组转成一段文本。 */
-export function toText(result) {
-  if (!result) return ''
-  const content = Array.isArray(result.content) ? result.content : []
-  const parts = []
+/**
+ * 把 MCP 的 content 数组拆成文本与图片两部分。
+ *
+ * 拆分而不是只管文本，是因为截图真的能送到模型眼前——宿主对工具结果里的
+ * image 块有专门搬运：provider adapter 会把它从纯文本的 tool 消息里提出来，
+ * 放到紧随其后的一条 user 消息（dsh-llm-deepseek/serialize 的
+ * 「Tool-result images follow their string-only tool messages」）。
+ * 之前这里只 join 文本，等于把图在桥这一层就丢了。
+ *
+ * 桥自己不做落盘：图片字节怎么存是宿主附件服务的事，这里只负责原样交出去。
+ */
+export function toContent(result) {
+  const content = Array.isArray(result?.content) ? result.content : []
+  const texts = []
+  const images = []
   for (const block of content) {
-    if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+    if (block?.type === 'text' && typeof block.text === 'string') {
+      texts.push(block.text)
+    } else if (block?.type === 'image' && typeof block.data === 'string' && block.data) {
+      // MCP 的字段名是 mimeType；缺省按 JPEG 猜（cua-mcp 只产出这一种）
+      images.push({ data: block.data, mimeType: block.mimeType || 'image/jpeg' })
+    }
   }
-  return parts.join('\n')
+  return { text: texts.join('\n'), images }
+}
+
+/** MCP 的 content 数组转成一段文本。图片由 {@link toContent} 交给调用方。 */
+export function toText(result) {
+  return toContent(result).text
 }

@@ -9,16 +9,18 @@
  *      由 schema-form 自动生成表单。改动经 ~/.dsh/dsh-cua.config.json 落到
  *      cua-mcp 子进程（它每次工具调用前按 mtime 热读，不需要重启）。
  *
- * 工具注册由 cordis.patch.yml 插入的 @deepseek-ai/dsh-mcp-client 完成：
- * 它把 bin/cua-mcp 这个 stdio MCP 服务器上的工具挂到 ctx.tools 上，
- * 模型看到的名字是 mcp__computer_use__<tool>。
+ * 工具注册由本插件自己完成（见 apply 里的 mountTools）：从 bin/cua-mcp 这个
+ * stdio MCP 服务器取 tools/list，逐个注册到 ctx.tools，工具名就是 MCP 原名
+ * （click / scroll / get_app_state …）。不走 @deepseek-ai/dsh-mcp-client，
+ * 因为它发 tools/call 时不带会话上下文，实时预览只能全局共享——
+ * 详见 mcp-bridge.js 顶部。
  *
  * 与 Codex 的 SkyComputerUseService 相比，这里没有代码签名鉴权层：
  * 二进制由 harness 自己直接拉起，AX/SCK/CGEvent 都在同一进程内完成。
  */
 
 import { existsSync, accessSync, constants, writeFileSync } from 'node:fs'
-import { McpBridge, toParameters, toText } from './mcp-bridge.js'
+import { McpBridge, toParameters, toContent } from './mcp-bridge.js'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
@@ -110,6 +112,40 @@ export const RuntimeSettings = Schema.object({
     .default([])
     .description('只允许操作的应用 bundleID 列表。非空时其余应用一律拒绝，优先级高于禁止列表。'),
 })
+
+/**
+ * 工具输出里图片的 canonical 形状。
+ *
+ * 宿主的 ImageBlock 不携带字节，只带一个 content-addressed 引用：
+ *   { type: 'image', attachment: ImageAttachmentRef }
+ * （见 @deepseek-ai/dsh-llm 的 types.d.ts）
+ * 所以必须先经 attachment 服务落盘拿到引用，render 时才还原得出来。
+ * 字段与 @deepseek-ai/dsh-tool-fs 的 IMAGE_VALUE_SCHEMA 保持一致，
+ * 少一个字段宿主校验就会拒掉整个结果。
+ */
+const IMAGE_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    attachmentId: { type: 'string', required: true },
+    mediaType: {
+      type: 'string',
+      enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+      required: true,
+    },
+    bytes: { type: 'integer', required: true },
+    width: { type: 'integer', required: true },
+    height: { type: 'integer', required: true },
+    name: { type: 'string' },
+  },
+}
+
+const IMAGE_EXTENSIONS = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+}
 
 function resolveBinary(config) {
   if (config.binary) return path.resolve(config.binary)
@@ -263,6 +299,92 @@ export async function apply(ctx, config) {
     throw new Error(`dsh-cua: ${label}，${toolName} 未执行`)
   }
 
+  // ---- 截图：从 cua-mcp 的 base64 到宿主的 ImageBlock ----
+  //
+  // 之前 toText 只拼 type==='text' 的块，图片在桥那一层就被丢掉了；
+  // browser_screenshot 只返回图片块，于是模型收到的是空字符串。
+  // 现在改成：execute 里把 JPEG 存进附件服务换一个引用，render 里还原成
+  // image 块。宿主会把工具结果里的图提出来放进紧随其后的一条 user 消息，
+  // 模型这才真的看得见画面。
+  const getService = (serviceName) => {
+    try {
+      return ctx.get(serviceName)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 当前路由的模型是否声明接受图片输入。
+   * 按 provider|model 缓存：查一次就够，而这是每次工具调用都要问的问题。
+   * 查询失败不写缓存，下次还能重试。
+   */
+  const imageCapability = new Map()
+  const routeAcceptsImages = async (exec) => {
+    const llm = getService('llm')
+    if (!llm || typeof llm.resolveModelInfo !== 'function') return false
+    const routed = exec?.agent?.session?.requestHeader?.()?.config
+    const provider = routed?.provider ?? exec?.agent?.options?.provider
+    const model = routed?.model ?? exec?.agent?.options?.model
+    if (!provider || !model) return false
+    const key = `${provider}|${model}`
+    if (imageCapability.has(key)) return imageCapability.get(key)
+    try {
+      const info = await llm.resolveModelInfo(provider, model, exec?.signal)
+      const ok = Array.isArray(info?.inputModalities) && info.inputModalities.includes('image')
+      imageCapability.set(key, ok)
+      return ok
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 把一张截图交给附件服务，换回可放进 ImageBlock 的引用。
+   *
+   * 四种情况都降级成「不带图」，而不是让整个工具调用失败：
+   * 没有附件服务、模型不吃图、格式不在白名单、服务拒收（超字节/尺寸限制）。
+   * 每种都在文本后补一句原因——静默丢图比丢失败更糟，模型会以为界面是空的，
+   * 然后基于空白继续操作。
+   */
+  const persistScreenshot = async (shot, exec) => {
+    if (!shot) return { image: undefined, note: '' }
+    const skip = (why) => ({ image: undefined, note: `\n（截图未能附带：${why}）` })
+
+    const attachments = getService('attachments')
+    if (!attachments || typeof attachments.saveImage !== 'function') {
+      return skip('宿主没有挂载附件服务')
+    }
+    const extension = IMAGE_EXTENSIONS[shot.mimeType]
+    if (!extension) return skip(`${shot.mimeType} 不是可存储的图片格式`)
+    if (!(await routeAcceptsImages(exec))) {
+      return skip('当前模型不接受图片输入')
+    }
+
+    try {
+      const ref = await attachments.saveImage({
+        data: Buffer.from(shot.data, 'base64'),
+        mediaType: shot.mimeType,
+        name: `cua-${Date.now()}${extension}`,
+      })
+      return {
+        image: {
+          attachmentId: ref.attachmentId,
+          mediaType: ref.mediaType,
+          bytes: ref.bytes,
+          width: ref.width,
+          height: ref.height,
+          // originalDimensions 不往上传：schema 里没声明它，
+          // additionalProperties: false 会把多出来的字段判成校验失败。
+        },
+        note: '',
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`dsh-cua: 截图未能存入附件服务 — ${error.message}`)
+      return skip(error.message)
+    }
+  }
+
   // 工具表来自子进程的 tools/list，只有拿到它才知道挂什么。
   // 一次失败就把整个会话变成「没有任何工具」，而多数失败都是瞬时的
   // （二进制正在被 build.sh 覆盖、握手竞争）。所以给它三次退避重试。
@@ -284,19 +406,39 @@ export async function apply(ctx, config) {
               schema: {
                 type: 'object',
                 additionalProperties: false,
-                properties: { text: { type: 'string', required: true } },
+                properties: {
+                  text: { type: 'string', required: true },
+                  // 可选：只有会截图的工具（get_app_state / browser_screenshot /
+                  // screen_state）才带它，其余工具返回 { text } 就够。
+                  image: IMAGE_VALUE_SCHEMA,
+                },
                 required: ['text'],
               },
-              render: (_args, value) => [{ type: 'text', text: value.text }],
+              render: (_args, value) => {
+                const blocks = [{ type: 'text', text: value.text }]
+                // value.image 已经是 ImageAttachmentRef 的形状（brand 是恒等函数），
+                // 直接当 attachment 用，不需要再转一次。
+                if (value.image) blocks.push({ type: 'image', attachment: value.image })
+                return blocks
+              },
             },
             execute: async (args, exec) => {
               await askApproval(tool.name, args, exec)
               // exec.agent.id 就是发起这次调用的会话；后台任务可能没有 agent
               const sessionId = exec?.agent?.id
               const result = await bridge.callTool(tool.name, args, sessionId)
-              const text = toText(result)
+              const { text, images } = toContent(result)
               if (result?.isError) throw new Error(text || `${tool.name} 执行失败`)
-              return { text }
+              // 一次调用最多附一张：cua-mcp 的截图工具都只产出一张
+              if (images.length > 1) {
+                ctx.logger?.debug?.(
+                  `dsh-cua: ${tool.name} 返回了 ${images.length} 张图，只附带第一张`,
+                )
+              }
+              const shot = await persistScreenshot(images[0], exec)
+              return shot.image
+                ? { text: text + shot.note, image: shot.image }
+                : { text: text + shot.note }
             },
           }),
         )
