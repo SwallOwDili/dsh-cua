@@ -17,7 +17,7 @@ Elements: 122
       [4] AXOutline desc="边栏"
 ```
 
-一行一个元素，前面是跨快照稳定的 ID。模型据此定位，不靠猜坐标。
+一行一个元素，前面是带编号的 ID。模型据此定位，不靠猜坐标。界面未变时 ID 跨快照稳定；界面重排时 ID 会变，操作前先刷新 `get_app_state`。
 
 ## 它做什么
 
@@ -148,7 +148,7 @@ echo "$(pwd)/bin/cua-mcp"
 
 | 工具 | 作用 |
 |---|---|
-| `list_apps` | 列出运行中的图形应用 |
+| `list_apps` | 列出运行中的图形应用（名称、bundle id、pid，`*` 标前台） |
 | `screen_state` | 返回 `locked` / `unlocked` |
 | `unlock_screen` | 唤醒屏幕并按需注入密码解锁，密码不落盘 |
 | `get_app_state` | 无障碍树文本 + 按需截图，默认增量 |
@@ -177,7 +177,6 @@ echo "$(pwd)/bin/cua-mcp"
 | `overlayEnabled` | `true` | 操作时在屏幕上标出目标 |
 | `livePreviewEnabled` | `true` | 对话页右上角的实时画面小窗，与上一条互不影响 |
 | `overlayTtlSeconds` | `20` | 标记停留时长 |
-| `backgroundSilence` | `true` | 后台操作不抢焦点 |
 | `scrollStepPx` | `40` | 滚动步长 |
 | `maxElements` | `4000` | 单次返回的元素上限 |
 | `syntheticActivate` | `true` | 让目标自认为前台（不夺走你的焦点） |
@@ -197,6 +196,11 @@ echo "$(pwd)/bin/cua-mcp"
 - **并行使用**：多个客户端共用同一个实时画面服务，目标按会话分流，互不可见。
 - **实时画面不出本机**：预览用的 18901 端口只绑 `127.0.0.1`，同网段访问不到；
   画面直接由本机进程推到浏览器，不经过任何外部服务。
+- **打开未运行的应用**：`open_app` 对未运行应用按「英文文件名 / bundle id / 完整路径」定位，
+  会在标准应用目录（`/Applications`、`/System/Applications` 等）按文件名搜索。
+  两个例外：系统应用的中文显示名（如「计算器」）是系统级本地化、不存进应用包，按中文名找不到；
+  受 Cryptexes 保护的系统应用（如 Safari）不在可遍历目录里，按文件名也找不到。
+  这两种情况请用 bundle id（如 `com.apple.calculator`、`com.apple.Safari`）。
 
 ## 许可
 

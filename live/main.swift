@@ -27,7 +27,8 @@ let listenPort: UInt16 = 18901
 /// 协议版本。cua-mcp 的 Live.ensureRunning 会拿它和期望值比对，
 /// 不符就把这个进程杀掉重开——Mach-O 一旦加载就固定在内存里，
 /// 二进制换了而老进程还活着时，不加这道校验就会一直在跑旧代码。
-let liveVersion = "1"
+/// v2：加 `--watch-stdin`（存活绑父进程）。
+let liveVersion = "2"
 let frameInterval: TimeInterval = 1.0 / 3.0
 // 预览卡显示宽度是 132 CSS px（见 client.js 的 CARD_W）。
 // 抓 2 倍做 retina 就够，480 是 3.6 倍过采样，四分之三的像素编码完就扔。
@@ -527,9 +528,14 @@ func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
 /// 记录请求，用来判断前端到底有没有在轮询（netstat 抓不到 fetch 的短连接）。
 enum RequestLog {
     static let path = "/tmp/cua-live-requests.log"
+    /// 默认一个字节都不写。这个日志是排查「前端到底有没有在轮询」用的，
+    /// 仓库里没有任何读取方；之前无条件写，等于在正式版里常开一条只写不读的日志。
+    /// 要用就 `DSH_CUA_LIVE_LOG=1` 起 cua-live。
+    static let enabled = ProcessInfo.processInfo.environment["DSH_CUA_LIVE_LOG"] == "1"
     static let lock = NSLock()
     static let maxBytes = 512 * 1024
     static func note(_ p: String) {
+        guard enabled else { return }
         lock.lock(); defer { lock.unlock() }
         let line = "\(Date().timeIntervalSince1970) \(p)\n"
         // /status 每 1.5 秒一条，不封顶会一直写下去。到 512KB 就整个重开。
@@ -789,6 +795,29 @@ do {
 }
 
 signal(SIGPIPE, SIG_IGN)
+
+// MARK: - 存活绑在开它的那个进程上
+
+/// `--watch-stdin`：stdin 是 cua-mcp 递过来的管子。
+/// 父进程一消失（正常退出、崩溃、被 SIGKILL），写端被内核回收，
+/// 这里 read 立刻返回 0，跟着退出——不留一个没人认领的常驻进程，
+/// 占着 18901、还带着屏幕录制授权在抓帧。
+///
+/// 为什么做成显式参数而不是默认行为：手动在终端跑的时候 stdin 是 tty，
+/// 默认行为会让「终端状态」悄悄决定进程生死；接 /dev/null 更会一起来就退。
+/// 有这根管子才认这根管子。
+if CommandLine.arguments.contains("--watch-stdin") {
+    Thread.detachNewThread {
+        var byte: UInt8 = 0
+        while true {
+            let n = read(0, &byte, 1)
+            if n > 0 { continue }       // 没人往这里写，读到什么就丢掉
+            if n < 0 && errno == EINTR { continue }
+            exit(0)                      // EOF 或读错：当作父进程没了
+        }
+    }
+}
+
 // RunLoop 而不是 dispatchMain：SCScreenshotManager 的 async 实现会 hop 主 actor，
 // dispatchMain() 让主线程进入 dispatch 队列后那些 continuation 永远不执行，
 // 表现是抓帧静默返回 nil（2026-10-27 踩过）。

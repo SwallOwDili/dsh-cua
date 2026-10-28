@@ -234,7 +234,7 @@ let socketPath = "/tmp/cua-overlay.sock"
 /// 版本标识。cua-mcp 启动时用 ping 校验，不匹配就杀掉旧进程重开，
 /// 否则二进制更新后旧代码会一直在内存里跑。
 enum Overlay {
-    static let version = "5"
+    static let version = "6"
 }
 let accent = NSColor(srgbRed: 0x33 / 255.0, green: 0x9C / 255.0, blue: 0xFF / 255.0, alpha: 1.0)
 /// 虚拟光标与左上角标记共用同一个强调色。
@@ -624,6 +624,42 @@ final class CommandServer {
 
 // MARK: - 入口
 
+// ---- 单实例 ----
+/// 同一时刻只允许一个 overlay。
+/// 之前没有锁：cua-mcp 探活失败会 unlink socket 再起一个新的，
+/// 而老实例的浮层还在屏上，结果是叠两个胶囊、点击被上面那层吃掉。
+/// flock 随进程消失由内核释放，不会留 stale 锁（锁文件本身留着无害）。
+/// 路径与 cua-mcp 里 Overlay.lockPath 必须一致：那边靠「锁在不在」判活。
+let instanceLockPath = "/tmp/cua-overlay.lock"
+let instanceLockFD = open(instanceLockPath, O_CREAT | O_RDWR, 0o600)
+if instanceLockFD >= 0, flock(instanceLockFD, LOCK_EX | LOCK_NB) != 0 {
+    // 已经有一个在跑，让位。抢的结果就是两个窗口，别抢。
+    // 留一行 stderr：手动跑时能立刻看出是「被锁挡回去」而不是「起来就崩」。
+    FileHandle.standardError.write(Data("cua-overlay: 已有实例持锁，本实例退出\n".utf8))
+    exit(0)
+}
+
+// ---- 退出时清掉自己建的 socket ----
+/// 用 inode 认亲，只删**自己建的那个** socket 文件。
+/// 直接 unlink 会误删：socket 被别人重建之后，老实例退出时
+/// 删掉的是新实例的文件，问题从「不删」变成「删错」。
+var socketInodeOfSelf: UInt64 = 0
+
+func rememberOwnSocket() {
+    var st = stat()
+    if stat(socketPath, &st) == 0 { socketInodeOfSelf = UInt64(st.st_ino) }
+}
+
+func cleanUpOwnSocket() {
+    guard socketInodeOfSelf != 0 else { return }
+    var st = stat()
+    guard stat(socketPath, &st) == 0, UInt64(st.st_ino) == socketInodeOfSelf else { return }
+    unlink(socketPath)
+}
+
+// quit、空闲自退、启动失败三条 exit 路径都走 atexit，不用各写一遍
+atexit(cleanUpOwnSocket)
+
 /// 空闲自退：浮层是被 mark 命令按需拉起的常驻进程，
 /// 没人再发指令就该退出。否则它会一直悬在某个窗口上面，
 /// 用户点那个应用时点击被浮层吃掉，表现为「应用打不开」。
@@ -644,5 +680,7 @@ if !server.start() {
     FileHandle.standardError.write("cua-overlay: socket 启动失败 \(socketPath)\n".data(using: .utf8)!)
     exit(1)
 }
+// bind 成功之后才记 inode：这之前的 socket 文件不是我们的
+rememberOwnSocket()
 
 app.run()

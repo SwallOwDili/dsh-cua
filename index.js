@@ -59,9 +59,6 @@ export const RuntimeSettings = Schema.object({
       '浏览器 CDP 端口。0 表示自动读取 DevToolsActivePort（Chrome / Edge / Brave / Chromium）。' +
         '要让 browser_* 工具作用于你正在用的浏览器，需以 --remote-debugging-port 启动它。',
     ),
-  browserCdpHost: Schema.string()
-    .default('127.0.0.1')
-    .description('CDP 主机地址，默认本机回环。'),
   overlayEnabled: Schema.boolean()
     .default(true)
     .description('是否在屏幕上显示「AI 正在操作」标记与橙色虚拟光标。'),
@@ -74,12 +71,6 @@ export const RuntimeSettings = Schema.object({
   overlayTtlSeconds: Schema.number()
     .default(20)
     .description('标记与虚拟光标在没有新动作后保留的秒数。'),
-  backgroundSilence: Schema.boolean()
-    .default(true)
-    .description(
-      '后台静默模式：点击与键入用 postToPid 定向投递、不抢焦点。' +
-        '关闭后改用真实 HID 事件（能驱动 Catalyst 手势，但会被前台窗口抢走）。',
-    ),
   scrollStepPx: Schema.number()
     .default(40)
     .description('滚动单步像素。过大时 Catalyst 应用会丢事件。'),

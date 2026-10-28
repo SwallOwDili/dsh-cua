@@ -31,12 +31,6 @@ window.__ModuleLoader__.load({
         hint: '0 = 自动读取 DevToolsActivePort。要操作后台标签页，需以 --remote-debugging-port=9222 启动浏览器后填 9222。',
       },
       {
-        field: 'browserCdpHost',
-        kind: 'text',
-        label: 'CDP 主机',
-        hint: '默认 127.0.0.1。',
-      },
-      {
         field: 'overlayEnabled',
         kind: 'boolean',
         label: '屏幕标记与虚拟光标',
@@ -53,12 +47,6 @@ window.__ModuleLoader__.load({
         kind: 'number',
         label: '标记保留秒数',
         hint: '没有新动作后，标记与光标在屏幕上保留多久。',
-      },
-      {
-        field: 'backgroundSilence',
-        kind: 'boolean',
-        label: '后台静默操作',
-        hint: '开启时点击与键入定向投递到目标进程，不抢前台焦点。',
       },
       {
         field: 'scrollStepPx',

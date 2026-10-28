@@ -136,6 +136,11 @@ enum History {
         var ignoredBundleIDs: [String] = []
     }
 
+    /// 归档段保留数量。段名是 `seg-<ISO8601>.jsonl`，字典序就是时间序。
+    /// 不设成 Settings 字段是刻意的：Settings 是合成 Codable，
+    /// 加字段会让老 settings.json 解码失败、把用户的开关一起丢回默认值。
+    static let maxArchivedSegments = 20
+
     static func loadSettings() -> Settings {
         guard let d = try? Data(contentsOf: settingsFile),
               let s = try? JSONDecoder().decode(Settings.self, from: d) else {
@@ -248,11 +253,29 @@ enum History {
             "endedAt": stamp,
             "eventCount": movedCount,
         ])
-        meta["segments"] = segs
+        // 先回收再落 metadata：删掉的段不该继续出现在索引里
+        let kept = pruneArchived()
+        meta["segments"] = segs.filter { kept.contains($0["file"] as? String ?? "") }
         if let d = try? JSONSerialization.data(withJSONObject: meta, options: .prettyPrinted) {
             try? d.write(to: metaFile)
         }
         rebuildMemory()
+    }
+
+    /// 只保留最近 `maxArchivedSegments` 个归档段，返回留下的文件名。
+    ///
+    /// 归档段只滚不删会一直堆在磁盘上，且 `rebuildMemory()` 每次重读全部归档段，
+    /// 历史越长越慢。越界和回收是同一件事，就在滚动这一刻一起做完，
+    /// 不留一个「以后谁来清」的缺口。
+    @discardableResult
+    static func pruneArchived() -> Set<String> {
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: archivedDir.path)) ?? [])
+            .filter { $0.hasSuffix(".jsonl") }.sorted()
+        guard files.count > maxArchivedSegments else { return Set(files) }
+        for f in files.dropLast(maxArchivedSegments) {
+            try? FileManager.default.removeItem(at: archivedDir.appendingPathComponent(f))
+        }
+        return Set(files.suffix(maxArchivedSegments))
     }
 
     static func status() -> [String: Any] {
@@ -399,11 +422,9 @@ func policyDecision(bundleID: String) -> String? {
 
 struct RuntimeConfig: Decodable {
     var browserCdpPort: Int = 0
-    var browserCdpHost: String = "127.0.0.1"
     var overlayEnabled: Bool = true
     var livePreviewEnabled: Bool = true
     var overlayTtlSeconds: Double = 20
-    var backgroundSilence: Bool = true
     var scrollStepPx: Int = 40
     var maxElements: Int = 4000
     var syntheticActivate: Bool = true
@@ -415,8 +436,8 @@ struct RuntimeConfig: Decodable {
     // 而配置文件允许只写部分键，所以逐字段 decodeIfPresent。
     // 手写 init(from:) 后编译器不再合成 CodingKeys，必须显式声明。
     enum CodingKeys: String, CodingKey {
-        case browserCdpPort, browserCdpHost, overlayEnabled, livePreviewEnabled, overlayTtlSeconds
-        case backgroundSilence, scrollStepPx, maxElements
+        case browserCdpPort, overlayEnabled, livePreviewEnabled, overlayTtlSeconds
+        case scrollStepPx, maxElements
         case syntheticActivate, historyEnabled, deniedBundleIDs, allowedBundleIDs
     }
 
@@ -425,11 +446,9 @@ struct RuntimeConfig: Decodable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         browserCdpPort = (try? c.decodeIfPresent(Int.self, forKey: .browserCdpPort)) .flatMap { $0 } ?? 0
-        browserCdpHost = (try? c.decodeIfPresent(String.self, forKey: .browserCdpHost)).flatMap { $0 } ?? "127.0.0.1"
         overlayEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .overlayEnabled)).flatMap { $0 } ?? true
         livePreviewEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .livePreviewEnabled)).flatMap { $0 } ?? true
         overlayTtlSeconds = (try? c.decodeIfPresent(Double.self, forKey: .overlayTtlSeconds)).flatMap { $0 } ?? 20
-        backgroundSilence = (try? c.decodeIfPresent(Bool.self, forKey: .backgroundSilence)).flatMap { $0 } ?? true
         scrollStepPx = (try? c.decodeIfPresent(Int.self, forKey: .scrollStepPx)).flatMap { $0 } ?? 40
         maxElements = (try? c.decodeIfPresent(Int.self, forKey: .maxElements)).flatMap { $0 } ?? 4000
         syntheticActivate = (try? c.decodeIfPresent(Bool.self, forKey: .syntheticActivate)).flatMap { $0 } ?? true
@@ -461,7 +480,6 @@ enum CuaConfig {
     }
 }
 
-let maxNodesDefault = 4000
 let maxDepth = 60
 let indentUnit = "  "
 
@@ -551,6 +569,46 @@ func allApps() -> [NSRunningApplication] {
 func candidateBundleID(_ q: String) -> String? {
     if q.contains("/") { return Bundle(url: URL(fileURLWithPath: q))?.bundleIdentifier }
     if q.contains("."), !q.contains(" ") { return q }
+    return nil
+}
+
+/// 按显示名在标准应用目录里找 `.app`（大小写不敏感、忽略扩展名）。
+/// 只查系统目录，不做全盘扫描；找不到返回 nil。
+///
+/// 文件名与本地化显示名可能不同（如「计算器」vs Calculator.app），
+/// 所以除了匹配文件名，也读 Info.plist 的 CFBundleDisplayName / CFBundleName。
+func findAppByDisplayName(_ name: String) -> URL? {
+    let dirs = [
+        "/Applications",
+        "/System/Applications",
+        "/System/Applications/Utilities",
+        "/System/Library/CoreServices",
+    ]
+    let target = name.lowercased()
+    let fm = FileManager.default
+    for dir in dirs {
+        let base = URL(fileURLWithPath: dir)
+        // 不能加 .skipsSubdirectoryDescendants：Safari 这类应用在 /Applications
+        // 里是符号链接（指向 Cryptexes 卷），该选项会把 symlink 当子目录跳掉，
+        // 导致纯名称匹配不到。contentsOfDirectory 本来只列一层，这里只需跳过隐藏项。
+        guard let entries = try? fm.contentsOfDirectory(
+            at: base, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]) else { continue }
+        for e in entries where e.pathExtension.lowercased() == "app" {
+            let bare = e.deletingPathExtension().lastPathComponent.lowercased()
+            if bare == target || bare == target + ".app" {
+                return e
+            }
+            // 读 Info.plist 里的显示名 / 名称，覆盖「中文显示名 vs 英文文件名」
+            let infoURL = e.appendingPathComponent("Contents/Info.plist")
+            guard let info = NSDictionary(contentsOf: infoURL) else { continue }
+            let display = (info["CFBundleDisplayName"] as? String)?.lowercased()
+            let bundle = (info["CFBundleName"] as? String)?.lowercased()
+            if display == target || bundle == target {
+                return e
+            }
+        }
+    }
     return nil
 }
 
@@ -1253,6 +1311,9 @@ enum Live {
     /// 抓帧是 3fps 的常驻开销，目标没变就不必重复通知
     static var lastKey = ""
     static var lastSentAt: Date = .distantPast
+    /// 发给 cua-live 的 stdin 管子，写端一直握在本进程手里。
+    /// 必须存成静态：局部 Pipe 一析构就关写端，live 会刚起就退。
+    static var stdinPipe: Pipe?
 
     static var binaryPath: String {
         let exe = Bundle.main.executableURL?.deletingLastPathComponent()
@@ -1290,7 +1351,8 @@ enum Live {
     }
 
     /// 与 cua-live 里 `liveVersion` 对应。改了它的接口语义就要一起改。
-    static let expectedVersion = "1"
+    /// v2：加 `--watch-stdin`，存活绑到父进程的管子上。
+    static let expectedVersion = "2"
 
     static func ensureRunning() {
         if let running = servingVersion() {
@@ -1308,8 +1370,16 @@ enum Live {
         guard FileManager.default.isExecutableFile(atPath: binaryPath) else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: binaryPath)
+        p.arguments = ["--watch-stdin"]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
+        // 生杀大权交给内核：live 的 stdin 接在这根管子的读端，写端留在本进程。
+        // 本进程一消失（正常退出 / 崩溃 / 被 SIGKILL），写端被回收，
+        // live 那边 read 立刻拿到 EOF 并自己退出。没有超时、没有轮询，
+        // 也没有「等下一个来擦屁股」的窗口 —— 谁开的，谁带走。
+        let pipe = Pipe()
+        p.standardInput = pipe
+        stdinPipe = pipe
         try? p.run()
         for _ in 0..<40 {
             if servingVersion() == expectedVersion { return }
@@ -1397,6 +1467,15 @@ enum Overlay {
         } else if Date().timeIntervalSince(lastSpawnAt) < 1.0 {
             // 刚拉起还在等它就绪，别连击
             return
+        } else if lockHeld() {
+            // 锁在 = 已经有实例活着，只是 socket 还没建好（正在启动）。
+            // 这里不能按 pgrep 去杀：会把「刚起来还在 bind」的实例当成僵尸干掉，
+            // 结果是屏幕上什么都没有。锁是所有权凭证，谁持锁谁是活的，别人别动。
+            return
+        } else {
+            // 锁没人持 = 上一个已经死透，只是留了个 socket 文件。
+            // 清掉陈旧文件再起新的（下面 spawn 前还会再 unlink 一次）。
+            unlink(socketPath)
         }
 
         lastSpawnAt = Date()
@@ -1405,6 +1484,9 @@ enum Overlay {
         unlink(socketPath)
         let p = Process()
         p.executableURL = URL(fileURLWithPath: binaryPath)
+        // 不让孩子继承 cua-mcp 的 stdin：那是 MCP 的协议管道，
+        // 万一哪天 overlay 顺手读一下，就会把请求报文吃掉。
+        p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         try? p.run()
@@ -1414,7 +1496,8 @@ enum Overlay {
         }
     }
 
-    static let expectedOverlayVersion = "5"
+    /// v6：加单实例 flock、退出时按 inode 清自己的 socket。
+    static let expectedOverlayVersion = "6"
 
     /// 向 overlay 发 ping 并读回版本号。任何异常都返回 nil。
     static func pingVersion() -> String? {
@@ -1452,6 +1535,26 @@ enum Overlay {
     /// 找出所有 cua-overlay 进程。旧版本不响应 quit 时兜底。
     static func overlayPIDs() -> [pid_t] {
         pids(matching: "cua-overlay")
+    }
+
+    /// cua-overlay 的单实例锁文件。与 overlay/main.swift 里的路径必须一致。
+    static let lockPath = "/tmp/cua-overlay.lock"
+
+    /// 锁被占 = 有实例活着。
+    ///
+    /// 比 pgrep 判活准确：进程可能刚起来、socket 还没 bind 完，
+    /// 这时 connect 探活是 false，但人家明明活着——按 pgrep 杀就会
+    /// 把正在启动的实例干掉，屏幕上反而什么都不出现。
+    /// 锁由内核随进程释放，不会出现「锁在但人没了」的假阳性。
+    static func lockHeld() -> Bool {
+        let fd = open(lockPath, O_RDWR)
+        guard fd >= 0 else { return false }   // 锁文件都没有，肯定没人
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            flock(fd, LOCK_UN)
+            return false
+        }
+        return true
     }
 
     /// 用一次 connect 探活，失败即视为没有 overlay 在监听。
@@ -2059,7 +2162,8 @@ func toolListApps(_ args: [String: Any]) throws -> [[String: Any]] {
 
     let text = apps.map { a in
         let star = (a["frontmost"] as? Bool == true) ? " *" : ""
-        return "\(a["name"] ?? "")  [\(a["bundle_id"] ?? "")]\(star)"
+        let pid = a["pid"] ?? ""
+        return "\(a["name"] ?? "")  [\(a["bundle_id"] ?? "")]  pid=\(pid)\(star)"
     }.joined(separator: "\n")
 
     return [["type": "text", "text": "\(apps.count) 个应用：\n" + text]]
@@ -2419,13 +2523,21 @@ func toolOpenApp(_ args: [String: Any]) throws -> [[String: Any]] {
         if case .appNotFound = e { ref = nil } else { throw e }
     }
     if ref == nil {
-        // 未运行：按路径或 bundleID 拉起
-        guard q.contains("/") || q.contains(".") else {
-            throw CUAError.appNotFound(q)
+        // 未运行：按路径、bundleID 或名称拉起
+        let url: URL
+        if q.contains("/") {
+            url = URL(fileURLWithPath: q)
+        } else if q.contains("."), !q.contains(" ") {
+            url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: q)
+                ?? URL(fileURLWithPath: "/Applications/\(q).app")
+        } else {
+            // 纯名称：在标准应用目录里按「名称.app」匹配。macOS 没有
+            // 按显示名反查未安装应用的公开 API，搜目录是最直接的兜底。
+            guard let hit = findAppByDisplayName(q) else {
+                throw CUAError.appNotFound(q)
+            }
+            url = hit
         }
-        let url = q.contains("/") ? URL(fileURLWithPath: q)
-                                  : (NSWorkspace.shared.urlForApplication(withBundleIdentifier: q)
-                                     ?? URL(fileURLWithPath: "/Applications/\(q).app"))
         // 这条路径跳过了 resolveApp 的策略判定，必须自己补一次，
         // 否则白/黑名单对 open_app 无效。
         let bid = candidateBundleID(q) ?? Bundle(url: url)?.bundleIdentifier ?? ""
@@ -2513,6 +2625,18 @@ func cdpBrowserBundleID(_ port: Int) -> String? {
     return nil
 }
 
+/// CDP 专用 URLSession：显式禁用系统代理。
+///
+/// CDP 端口绑在 127.0.0.1，而 macOS 上 URLSession.shared 会套用系统 HTTP/HTTPS
+/// 代理（用户开了 Clash / Surge 这类时常见）。代理不知道本机调试端口，请求会
+/// 直接「Could not connect」。给本机回环请求禁用代理是唯一稳妥做法。
+let cdpSession: URLSession = {
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.connectionProxyDictionary = [:]
+    cfg.timeoutIntervalForRequest = 6
+    return URLSession(configuration: cfg)
+}()
+
 func cdpJSON(_ port: Int, _ path: String, method: String = "GET") throws -> Any {
     guard let url = URL(string: "http://127.0.0.1:\(port)\(path)") else {
         throw CUAError.badRequest("非法 CDP 路径: \(path)")
@@ -2523,7 +2647,7 @@ func cdpJSON(_ port: Int, _ path: String, method: String = "GET") throws -> Any 
     let sem = DispatchSemaphore(value: 0)
     var data: Data?
     var err: Error?
-    URLSession.shared.dataTask(with: req) { d, _, e in data = d; err = e; sem.signal() }.resume()
+    cdpSession.dataTask(with: req) { d, _, e in data = d; err = e; sem.signal() }.resume()
     if sem.wait(timeout: .now() + 7) == .timedOut {
         throw CUAError.eventFailed("CDP HTTP 超时（端口 \(port)）")
     }
@@ -2541,7 +2665,7 @@ func cdpTabs(_ port: Int) throws -> [[String: Any]] {
 
 func cdpSend(_ wsURL: String, method: String, params: [String: Any]) throws -> [String: Any] {
     guard let url = URL(string: wsURL) else { throw CUAError.badRequest("非法 ws 地址") }
-    let task = URLSession.shared.webSocketTask(with: url)
+    let task = cdpSession.webSocketTask(with: url)
     task.resume()
     defer { task.cancel(with: .goingAway, reason: nil) }
 
@@ -2954,7 +3078,7 @@ let tools: [ToolDef] = [
                 "password": ["type": "string", "description": "登录密码；省略则只唤醒屏幕等待人工解锁"],
             ], [])),
     ToolDef(name: "get_app_state",
-            description: "获取应用的辅助功能树文本，以及一张截图。返回的 [数字] 是元素 ID，供后续动作使用。元素 ID 跨快照稳定，界面变化后仍可沿用。",
+            description: "获取应用的辅助功能树文本，以及一张截图。返回的 [数字] 是元素 ID，供后续动作使用。界面未变时元素 ID 跨快照稳定；界面重排（如内容变化导致元素增减）时 ID 会随之变化，操作前若报「不在当前快照」请先重新 get_app_state。",
             schema: obj([
                 "app": appP,
                 "diff": ["type": "string", "enum": ["auto", "cumulative", "none"],
@@ -3164,6 +3288,19 @@ func selfTest() -> Int32 {
         sem.signal()
     }
     _ = sem.wait(timeout: .now() + 20)
+
+    // 窗口列表自检：overlay 与实时预览都靠 windowID(for:) 定位窗口。
+    // 它返回 nil 时 mark() 会静默什么都不画——表现就是「操作了但没有标记、
+    // 也没有预览」，且不给任何提示。这一步把两种情形分开报：
+    // 拿不到窗口列表（权限/环境问题）vs 拿得到但没有该进程的窗口。
+    let winList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                             kCGNullWindowID) as? [[String: Any]]
+    var probes: [String] = []
+    for a in allApps().prefix(3) {
+        let wid = windowID(for: a.processIdentifier)
+        probes.append("\(a.localizedName ?? "?")=\(wid.map(String.init) ?? "nil")")
+    }
+    print("window list:", winList?.count ?? -1, "probe:", probes.joined(separator: " "))
 
     if let src = CGEventSource(stateID: .hidSystemState),
        let ev = CGEvent(keyboardEventSource: src, virtualKey: 0x38, keyDown: true) {
